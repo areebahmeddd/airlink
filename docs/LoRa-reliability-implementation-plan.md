@@ -63,7 +63,7 @@ The implementation is complete only when all of the following are true:
 | 1. Airtime-safe SX1262 operation | Complete | `028511e` | Host/profile tests, both firmware targets, and SF10-SF12 two-board radio tests passed |
 | 2. Atomic packet scheduling and backpressure | Complete | `fe9e95e` | Concurrent saturation, both firmware targets, and two-board SF10 smoke passed |
 | 3. Addressed trunk protocol and migration | Complete | `3ee5843` | v2/v3 host protocol suite, both firmware targets, and addressed two-board v3 smoke passed |
-| 4. Packet-level reliability and reassembly | Pending | — | — |
+| 4. Packet-level reliability and reassembly | Complete | Pending checkpoint | 99.35% sender completion at 30% data/feedback loss; five-of-five two-board transfer gate |
 | 5. Discovery and shared-channel behavior | Pending | — | — |
 | 6. LoRa multi-hop forwarding | Pending | — | — |
 | 7. Link adaptation and PHY hardening | Pending | — | — |
@@ -359,27 +359,27 @@ reliability that remains correct under loss, duplicates, and reordering.
 
 ### Checklist
 
-- [ ] Implement packet-level selective repeat with a received-fragment bitmap.
-- [ ] Allow more than one useful fragment per round trip while keeping memory
+- [x] Implement packet-level selective repeat with a received-fragment bitmap.
+- [x] Allow more than one useful fragment per round trip while keeping memory
       and airtime bounded.
-- [ ] Send bitmap ACKs only from the addressed destination.
-- [ ] Define a final COMPLETE acknowledgement that is sent only after full
+- [x] Send bitmap ACKs only from the addressed destination.
+- [x] Define a final COMPLETE acknowledgement that is sent only after full
       reassembly and length validation.
-- [ ] Re-ACK duplicate fragments and duplicate completed transfers without
+- [x] Re-ACK duplicate fragments and duplicate completed transfers without
       delivering the BitChat packet twice.
-- [ ] Derive retry and reassembly deadlines from SF, bandwidth, coding rate,
+- [x] Derive retry and reassembly deadlines from SF, bandwidth, coding rate,
       fragment count, retry budget, and contention allowance.
-- [ ] Refresh the progress deadline when a new fragment arrives, while enforcing
+- [x] Refresh the progress deadline when a new fragment arrives, while enforcing
       an absolute maximum transfer lifetime.
-- [ ] Retain completed-transfer state long enough to answer a sender that missed
+- [x] Retain completed-transfer state long enough to answer a sender that missed
       the final COMPLETE acknowledgement.
-- [ ] Add explicit abort handling for retry exhaustion, invalid total length,
+- [x] Add explicit abort handling for retry exhaustion, invalid total length,
       resource pressure, and radio reset.
-- [ ] Ensure a dropped transfer releases all packet-pool and reassembly
+- [x] Ensure a dropped transfer releases all packet-pool and reassembly
       resources.
-- [ ] Test loss, ACK loss, duplication, reordering, delayed ACKs, restart, and
+- [x] Test loss, ACK loss, duplication, reordering, delayed ACKs, restart, and
       sequence wrap.
-- [ ] Test 1- through 5-fragment packets at every supported SF.
+- [x] Test 1- through 5-fragment packets at every supported SF.
 
 ### Success criteria
 
@@ -393,9 +393,35 @@ reliability that remains correct under loss, duplicates, and reordering.
 
 ### Milestone record
 
-- Status: Pending
+- Status: Complete
 - Evidence:
-- Commit:
+  - The deterministic eight-round simulation completed 1,987 of 2,000
+    520-byte sender transfers (99.35%) with independently injected 30% data
+    and feedback loss. Receivers reconstructed 1,999 transfers, delivered
+    every transfer at most once, and never accepted corrupt or incomplete
+    data.
+  - Portable cases cover cumulative bitmap selection, lost COMPLETE,
+    duplicate and reordered frames, delayed feedback, incomplete receiver
+    restart, boot-epoch/counter wrap, exact encoded length validation, and a
+    sustained incomplete-transfer flood.
+  - Airtime-derived feedback, progress, absolute, and retention deadlines pass
+    for one through five fragments at SF7 through SF12. Reassembly remains
+    bounded to two active slots plus six completed-transfer records, reserves
+    addressed admission under broadcast pressure, and never evicts an active
+    transfer.
+  - Normal ESP-IDF 6.0 firmware builds pass for the Heltec V3 ESP32-S3 and
+    BLE-only ESP32-C3 targets.
+  - The two-board SF10 gate admitted five addressed probes spanning one through
+    five fragments. The receiver emitted all five exact COMPLETE masks and the
+    sender recorded five terminal completions, with no protocol abort,
+    invalid reassembly, resource abort, radio-command error, BUSY timeout,
+    watchdog recovery, or duplicate delivery.
+  - Temporary channel occupancy no longer rejects an addressed transfer after
+    a fixed CAD count; the radio returns to RX during backoff and retries
+    within the transfer's bounded absolute deadline.
+  - Both test boards were restored to the normal SF10 image with diagnostic
+    smoke disabled after the capture.
+- Commit: Pending checkpoint
 - Suggested commit subject: `feat(lora): add packet-level selective repeat ARQ`
 
 ## Milestone 5: Discovery and shared-channel behavior

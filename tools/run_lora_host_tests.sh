@@ -6,7 +6,8 @@ airtime_bin="$(mktemp "${TMPDIR:-/tmp}/bitle-lora-airtime.XXXXXX")"
 region_bin="$(mktemp "${TMPDIR:-/tmp}/bitle-lora-region.XXXXXX")"
 scheduler_bin="$(mktemp "${TMPDIR:-/tmp}/bitle-lora-scheduler.XXXXXX")"
 trunk_bin="$(mktemp "${TMPDIR:-/tmp}/bitle-lora-trunk.XXXXXX")"
-trap 'rm -f "$airtime_bin" "$region_bin" "$scheduler_bin" "$trunk_bin"' EXIT
+reliability_bin="$(mktemp "${TMPDIR:-/tmp}/bitle-lora-reliability.XXXXXX")"
+trap 'rm -f "$airtime_bin" "$region_bin" "$scheduler_bin" "$trunk_bin" "$reliability_bin"' EXIT
 
 cc -std=c11 -Wall -Wextra -Werror \
     -I"$repo_root/main" \
@@ -36,6 +37,14 @@ cc -std=c11 -Wall -Wextra -Werror \
     "$repo_root/main/lora_trunk_protocol.c" \
     -o "$trunk_bin"
 "$trunk_bin"
+
+cc -std=c11 -Wall -Wextra -Werror \
+    -I"$repo_root/main" \
+    "$repo_root/tests/test_lora_packet_reliability.c" \
+    "$repo_root/main/lora_packet_reliability.c" \
+    "$repo_root/main/lora_airtime.c" \
+    -lm -o "$reliability_bin"
+"$reliability_bin"
 
 cd "$repo_root"
 python3 -m unittest discover -s tests -p 'test_lora_*.py' -v

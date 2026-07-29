@@ -33,19 +33,21 @@ static lora_trunk_frame_t make_data(
     return frame;
 }
 
-static lora_trunk_frame_t make_ack(const lora_trunk_frame_t *data)
+static lora_trunk_frame_t make_control(
+    const lora_trunk_frame_t *data, lora_trunk_kind_t kind,
+    uint8_t value)
 {
-    lora_trunk_frame_t ack = {
+    lora_trunk_frame_t control = {
         .version = LORA_TRUNK_V3_VERSION,
-        .kind = LORA_TRUNK_KIND_FRAGMENT_ACK,
+        .kind = kind,
         .capabilities = LORA_TRUNK_V3_CAP_PROTOCOL,
-        .fragment_index = data->fragment_index,
+        .fragment_index = value,
         .fragment_total = data->fragment_total,
     };
-    memcpy(ack.source, data->destination, 8);
-    memcpy(ack.destination, data->source, 8);
-    memcpy(ack.transfer_id, data->transfer_id, 12);
-    return ack;
+    memcpy(control.source, data->destination, 8);
+    memcpy(control.destination, data->source, 8);
+    memcpy(control.transfer_id, data->transfer_id, 12);
+    return control;
 }
 
 static size_t encode(
@@ -91,26 +93,48 @@ static void test_v3_round_trip_and_malformed(void)
     assert(!lora_trunk_v3_encode(&invalid, wire, sizeof(wire), &len));
 }
 
-static void test_exact_ack_matching(void)
+static void test_exact_control_matching(void)
 {
     lora_trunk_frame_t data = make_data(SOURCE_A, SOURCE_B, false);
-    lora_trunk_frame_t ack = make_ack(&data);
-    assert(lora_trunk_v3_ack_matches(&data, &ack));
+    lora_trunk_frame_t ack =
+        make_control(&data, LORA_TRUNK_KIND_BITMAP_ACK, 0x03);
+    assert(lora_trunk_v3_control_matches(&data, &ack));
 
     memcpy(ack.source, SOURCE_C, 8);
-    assert(!lora_trunk_v3_ack_matches(&data, &ack));
-    ack = make_ack(&data);
+    assert(!lora_trunk_v3_control_matches(&data, &ack));
+    ack = make_control(&data, LORA_TRUNK_KIND_BITMAP_ACK, 0x03);
     ack.destination[0] ^= 1;
-    assert(!lora_trunk_v3_ack_matches(&data, &ack));
-    ack = make_ack(&data);
+    assert(!lora_trunk_v3_control_matches(&data, &ack));
+    ack = make_control(&data, LORA_TRUNK_KIND_BITMAP_ACK, 0x03);
     ack.transfer_id[11] ^= 1;
-    assert(!lora_trunk_v3_ack_matches(&data, &ack));
-    ack = make_ack(&data);
-    ack.fragment_index ^= 1;
-    assert(!lora_trunk_v3_ack_matches(&data, &ack));
-    ack = make_ack(&data);
+    assert(!lora_trunk_v3_control_matches(&data, &ack));
+    ack = make_control(&data, LORA_TRUNK_KIND_BITMAP_ACK, 0x03);
     ack.fragment_total ^= 1;
-    assert(!lora_trunk_v3_ack_matches(&data, &ack));
+    assert(!lora_trunk_v3_control_matches(&data, &ack));
+
+    uint8_t wire[255];
+    size_t len = 0;
+    lora_trunk_frame_t parsed;
+    ack = make_control(&data, LORA_TRUNK_KIND_BITMAP_ACK, 0x03);
+    len = encode(&ack, wire);
+    assert(lora_trunk_parse(wire, len, &parsed) ==
+           LORA_TRUNK_PARSE_OK);
+    ack.fragment_index = 0;
+    assert(!lora_trunk_v3_encode(&ack, wire, sizeof(wire), &len));
+    ack = make_control(&data, LORA_TRUNK_KIND_COMPLETE, 0x07);
+    len = encode(&ack, wire);
+    assert(lora_trunk_parse(wire, len, &parsed) ==
+           LORA_TRUNK_PARSE_OK);
+    ack.fragment_index = 0x03;
+    assert(!lora_trunk_v3_encode(&ack, wire, sizeof(wire), &len));
+    ack = make_control(
+        &data, LORA_TRUNK_KIND_ABORT,
+        LORA_TRUNK_ABORT_RESOURCE_PRESSURE);
+    len = encode(&ack, wire);
+    assert(lora_trunk_parse(wire, len, &parsed) ==
+           LORA_TRUNK_PARSE_OK);
+    ack.fragment_index = 0;
+    assert(!lora_trunk_v3_encode(&ack, wire, sizeof(wire), &len));
 }
 
 static void test_two_senders_and_broadcast(void)
@@ -259,7 +283,7 @@ static void test_deterministic_parser_fuzz(void)
 int main(void)
 {
     test_v3_round_trip_and_malformed();
-    test_exact_ack_matching();
+    test_exact_control_matching();
     test_two_senders_and_broadcast();
     test_v2_policy();
     test_neighbor_routes_and_collision();

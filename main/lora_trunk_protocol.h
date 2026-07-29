@@ -28,8 +28,17 @@ extern "C" {
 
 typedef enum {
     LORA_TRUNK_KIND_DATA = 1,
-    LORA_TRUNK_KIND_FRAGMENT_ACK = 2,
+    LORA_TRUNK_KIND_BITMAP_ACK = 2,
+    LORA_TRUNK_KIND_COMPLETE = 3,
+    LORA_TRUNK_KIND_ABORT = 4,
 } lora_trunk_kind_t;
+
+typedef enum {
+    LORA_TRUNK_ABORT_RETRY_EXHAUSTED = 1,
+    LORA_TRUNK_ABORT_INVALID_LENGTH = 2,
+    LORA_TRUNK_ABORT_RESOURCE_PRESSURE = 3,
+    LORA_TRUNK_ABORT_RADIO_RESET = 4,
+} lora_trunk_abort_reason_t;
 
 typedef enum {
     LORA_TRUNK_V3_FLAG_ACK_REQUESTED = 0x01,
@@ -69,9 +78,11 @@ bool lora_trunk_v3_encode(
     const lora_trunk_frame_t *frame, uint8_t *out, size_t capacity,
     size_t *out_len);
 
-/* Exact v3 fragment acknowledgement predicate. */
-bool lora_trunk_v3_ack_matches(
-    const lora_trunk_frame_t *data, const lora_trunk_frame_t *ack);
+/* Exact v3 packet-control predicate. A bitmap ACK, COMPLETE, or ABORT must
+ * reverse source/destination and match the full transfer tuple. */
+bool lora_trunk_v3_control_matches(
+    const lora_trunk_frame_t *data,
+    const lora_trunk_frame_t *control);
 
 /* 96-bit transfer ID: unpredictable 64-bit boot epoch plus BE counter. */
 void lora_trunk_make_transfer_id(

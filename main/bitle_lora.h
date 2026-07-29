@@ -6,8 +6,8 @@
  * The trunk registers one bitle_link (handle BITLE_LORA_LINK_HANDLE) for
  * the whole medium once an SX1262 is detected, so the mesh core relays
  * BLE<->LoRa with no special cases. Encoded BitChat packets originate as v3
- * fragments under a 44-byte addressed trunk header with exact per-fragment
- * acknowledgement. The receive path retains strict v2 migration parsing;
+ * fragments under a 44-byte addressed trunk header with cumulative bitmap
+ * feedback and terminal COMPLETE. The receive path retains strict v2 parsing;
  * frames from foreign LoRa protocols fail the magic check and are dropped
  * before touching the mesh.
  *
@@ -62,6 +62,14 @@ typedef struct {
     uint32_t malformed_frames;
     uint32_t unsupported_versions;
     uint32_t rejected_acks;
+    uint32_t bitmap_acks;
+    uint32_t complete_acks;
+    uint32_t duplicate_fragments;
+    uint32_t duplicate_transfers;
+    uint32_t transfer_aborts_tx;
+    uint32_t transfer_aborts_rx;
+    uint32_t invalid_reassemblies;
+    uint32_t resource_aborts;
     uint32_t neighbor_collisions;
     uint32_t neighbor_count;
 } bitle_lora_diag_t;

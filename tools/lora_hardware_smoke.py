@@ -37,6 +37,13 @@ PROTOCOL_DIAG_RE = re.compile(
     r"malformed=(\d+) unsupported=(\d+) ack_reject=(\d+) "
     r"neighbors=(\d+) collision=(\d+)"
 )
+RELIABILITY_DIAG_RE = re.compile(
+    r"bitmap=(\d+) final=(\d+) dup=(\d+)/(\d+) "
+    r"abort=(\d+)/(\d+) invalid=(\d+) resource=(\d+)"
+)
+CONTROL_RE = re.compile(
+    r"v3 control (TX|RX) kind=(\d+) value=0x([0-9a-fA-F]{2})"
+)
 
 
 def reader(
@@ -171,12 +178,41 @@ def main() -> int:
                     summary[label]["diagnostics"][-1].update(protocol_diag)
                 else:
                     summary[label]["diagnostics"].append(protocol_diag)
+            if match := RELIABILITY_DIAG_RE.search(line):
+                reliability_diag = {
+                    "bitmap_acks": int(match.group(1)),
+                    "complete_acks": int(match.group(2)),
+                    "duplicate_fragments": int(match.group(3)),
+                    "duplicate_transfers": int(match.group(4)),
+                    "transfer_aborts_tx": int(match.group(5)),
+                    "transfer_aborts_rx": int(match.group(6)),
+                    "invalid_reassemblies": int(match.group(7)),
+                    "resource_aborts": int(match.group(8)),
+                }
+                if summary[label]["diagnostics"]:
+                    summary[label]["diagnostics"][-1].update(
+                        reliability_diag
+                    )
+                else:
+                    summary[label]["diagnostics"].append(
+                        reliability_diag
+                    )
             if "authenticated neighbor" in line:
                 summary[label]["events"]["authenticated_neighbor"] += 1
-            if "v3 ack TX" in line:
-                summary[label]["events"]["v3_ack_tx"] += 1
-            if "v3 ack RX" in line:
-                summary[label]["events"]["v3_ack_rx"] += 1
+            if match := CONTROL_RE.search(line):
+                direction = match.group(1).lower()
+                kind = int(match.group(2))
+                value = int(match.group(3), 16)
+                names = {2: "bitmap", 3: "complete", 4: "abort"}
+                if kind in names:
+                    summary[label]["events"][
+                        f"v3_{names[kind]}_{direction}"
+                    ] += 1
+                    summary[label]["events"][
+                        f"v3_{names[kind]}_{direction}_value_{value}"
+                    ] += 1
+            if "trunk transfer COMPLETE" in line:
+                summary[label]["events"]["transfer_complete"] += 1
             if "TX watchdog expired" in line:
                 summary[label]["events"]["tx_watchdog_expired"] += 1
             if "radio recovered on attempt" in line:

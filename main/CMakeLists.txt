@@ -10,6 +10,7 @@ idf_component_register(
         "bitle_mesh.c"
         "bitle_lora.c"
         "lora_airtime.c"
+        "lora_packet_reliability.c"
         "lora_region.c"
         "lora_trunk_protocol.c"
         "lora_tx_scheduler.c"

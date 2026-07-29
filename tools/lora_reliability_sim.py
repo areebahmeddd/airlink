@@ -189,3 +189,170 @@ class LegacyV2Model:
             elapsed += ack_airtime
         span = elapsed - (first_rx_at or 0)
         return span > self.config.reassembly_timeout_ms, span
+
+
+@dataclass(frozen=True)
+class SelectiveRepeatConfig:
+    data_loss: float = 0.0
+    ack_loss: float = 0.0
+    duplication: float = 0.0
+    reorder: bool = False
+    feedback_delay_rounds: int = 0
+    maximum_rounds: int = 8
+    chunk_size: int = 120
+    seed: int = 1
+
+
+@dataclass(frozen=True)
+class TransferResult:
+    complete: bool
+    delivered: bool
+    delivery_count: int
+    rounds: int
+    data_attempts: int
+    feedback_attempts: int
+
+
+class SelectiveRepeatModel:
+    """Executable specification of cumulative bitmap/COMPLETE behavior."""
+
+    def __init__(self, config: SelectiveRepeatConfig):
+        for name, value in (
+            ("data_loss", config.data_loss),
+            ("ack_loss", config.ack_loss),
+            ("duplication", config.duplication),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between zero and one")
+        if config.maximum_rounds <= 0 or config.chunk_size <= 0:
+            raise ValueError("round and chunk bounds must be positive")
+        if config.feedback_delay_rounds < 0:
+            raise ValueError("feedback delay cannot be negative")
+        self.config = config
+        self.random = random.Random(config.seed)
+
+    @staticmethod
+    def transfer_id(boot_epoch: bytes, counter: int) -> bytes:
+        if len(boot_epoch) != 8:
+            raise ValueError("boot epoch must contain eight bytes")
+        if not 1 <= counter <= 0xFFFFFFFF:
+            raise OverflowError("transfer counter exhausted")
+        return boot_epoch + counter.to_bytes(4, "big")
+
+    def transfer(
+        self, packet_len: int, *, receiver_restart_round: int | None = None
+    ) -> TransferResult:
+        fragment_total = math.ceil(packet_len / self.config.chunk_size)
+        if packet_len <= 0 or not 1 <= fragment_total <= 5:
+            raise ValueError("packet must contain one through five fragments")
+        wanted = (1 << fragment_total) - 1
+        receiver_mask = 0
+        sender_mask = 0
+        delivered = False
+        delivery_count = 0
+        complete = False
+        data_attempts = 0
+        feedback_attempts = 0
+        pending_feedback: list[tuple[int, int, bool]] = []
+
+        for round_index in range(self.config.maximum_rounds):
+            if receiver_restart_round == round_index and not delivered:
+                receiver_mask = 0
+                pending_feedback.clear()
+
+            for due, bitmap, is_complete in list(pending_feedback):
+                if due <= round_index:
+                    pending_feedback.remove((due, bitmap, is_complete))
+                    if self.random.random() >= self.config.ack_loss:
+                        sender_mask |= bitmap
+                        complete = complete or is_complete
+            if complete:
+                return TransferResult(
+                    True, delivered, delivery_count, round_index,
+                    data_attempts, feedback_attempts
+                )
+
+            missing = wanted & ~sender_mask
+            fragments = [
+                index
+                for index in range(fragment_total)
+                if missing & (1 << index)
+            ]
+            if not fragments:
+                fragments = [fragment_total - 1]
+            if self.config.reorder:
+                self.random.shuffle(fragments)
+
+            for index in fragments:
+                data_attempts += 1
+                if self.random.random() < self.config.data_loss:
+                    continue
+                copies = (
+                    2
+                    if self.random.random() < self.config.duplication
+                    else 1
+                )
+                for _ in range(copies):
+                    receiver_mask |= 1 << index
+                    if receiver_mask == wanted and not delivered:
+                        delivered = True
+                        delivery_count += 1
+                    feedback_attempts += 1
+                    pending_feedback.append(
+                        (
+                            round_index +
+                            self.config.feedback_delay_rounds,
+                            receiver_mask,
+                            receiver_mask == wanted,
+                        )
+                    )
+
+            for due, bitmap, is_complete in list(pending_feedback):
+                if due <= round_index:
+                    pending_feedback.remove((due, bitmap, is_complete))
+                    if self.random.random() >= self.config.ack_loss:
+                        sender_mask |= bitmap
+                        complete = complete or is_complete
+            if complete:
+                return TransferResult(
+                    True, delivered, delivery_count, round_index + 1,
+                    data_attempts, feedback_attempts
+                )
+
+        return TransferResult(
+            False, delivered, delivery_count,
+            self.config.maximum_rounds,
+            data_attempts, feedback_attempts
+        )
+
+
+class BoundedReassemblyModel:
+    """Capacity model matching firmware's reject-new-transfer policy."""
+
+    def __init__(self, active_capacity: int = 2, completed_capacity: int = 6):
+        if active_capacity <= 0 or completed_capacity <= 0:
+            raise ValueError("capacities must be positive")
+        self.active_capacity = active_capacity
+        self.completed_capacity = completed_capacity
+        self.active: set[bytes] = set()
+        self.completed: list[bytes] = []
+        self.resource_aborts = 0
+
+    def accept_fragment(self, transfer_id: bytes) -> bool:
+        if transfer_id in self.completed or transfer_id in self.active:
+            return True
+        if len(self.active) >= self.active_capacity:
+            self.resource_aborts += 1
+            return False
+        self.active.add(transfer_id)
+        return True
+
+    def complete(self, transfer_id: bytes) -> bool:
+        if transfer_id in self.completed:
+            return False
+        if transfer_id not in self.active:
+            return False
+        self.active.remove(transfer_id)
+        self.completed.append(transfer_id)
+        self.completed = self.completed[-self.completed_capacity :]
+        return True

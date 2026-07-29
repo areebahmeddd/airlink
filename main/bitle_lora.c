@@ -16,6 +16,7 @@
 #include "bitle_mesh.h"
 #include "bitle_stats.h"
 #include "lora_airtime.h"
+#include "lora_packet_reliability.h"
 #include "lora_region.h"
 #include "lora_trunk_protocol.h"
 #include "lora_tx_scheduler.h"
@@ -107,18 +108,13 @@ static const char *TAG = "bitle_lora";
 #define TRUNK_CHUNK_TX   120
 #define TRUNK_MAX_FRAGS  ((BITCHAT_BLE_MAX_PACKET_SIZE + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX)
 
-/* Stop-and-wait ARQ: each ack-requested frame is retransmitted until
- * acked, ARQ_TRIES sends total. Announces are broadcast discovery and
- * repeat periodically anyway, so they never request acks. Retries bypass
- * the governor (bounded 3x; the admit debit paid for attempt one). */
-#define ARQ_TRIES        3
-#define ARQ_MARGIN_MS    1200
-
 /* Channel access: CAD (listen-before-talk) + random backoff before TX. */
 #define CAD_RETRIES      5
 #define CAD_BACKOFF_MIN  30
 #define CAD_BACKOFF_SPAN 120
 #define ACK_BURST_MAX    4
+#define RELIABILITY_CONTENTION_MS \
+    (1200U + CAD_RETRIES * (CAD_BACKOFF_MIN + CAD_BACKOFF_SPAN))
 
 typedef struct {
     uint16_t len;
@@ -144,11 +140,12 @@ typedef struct {
 } tx_trunk_context_t;
 static tx_trunk_context_t s_tx_context[LORA_TX_PACKET_POOL_SIZE];
 
-/* Ack seen by rx_frame for the frame the ARQ machine is waiting on.
- * rx_frame runs on the lora task itself, so plain statics suffice. */
-static bool s_ack_seen;
-static bool s_expected_ack_valid;
-static lora_trunk_frame_t s_expected_ack_data;
+/* Packet-level feedback is consumed on the LoRa task. RX and TX state are
+ * therefore serialized without another lock. */
+static bool s_feedback_seen;
+static bool s_expected_control_valid;
+static lora_trunk_frame_t s_expected_control_data;
+static lora_selective_tx_t s_selective_tx;
 static lora_trunk_neighbor_table_t s_neighbors;
 
 /* Modem params (for airtime), governor, and throttle state — shared
@@ -184,6 +181,18 @@ static uint32_t trunk_airtime_ms(uint16_t payload_len)
         .crc_enabled = true,
     };
     return lora_airtime_ms(&params, payload_len);
+}
+
+static bool trunk_reliability_timing(
+    uint8_t fragment_total, lora_reliability_timing_t *out)
+{
+    return lora_reliability_timing(
+        trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN + TRUNK_CHUNK_TX),
+        trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN),
+        fragment_total,
+        LORA_SELECTIVE_REPEAT_ROUNDS,
+        RELIABILITY_CONTENTION_MS,
+        out);
 }
 
 static void diag_inc(uint32_t *counter)
@@ -307,9 +316,12 @@ static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
     return true;
 }
 
-/* Reassembly of one inbound packet per remote sender (2 slots). */
+/* Reassembly stays statically bounded. Progress and absolute deadlines are
+ * profile-derived per transfer; the completed cache answers a sender that
+ * missed COMPLETE without delivering the BitChat packet twice. */
 typedef struct {
     bool in_use;
+    bool addressed;
     uint8_t version;
     uint8_t src[LORA_TRUNK_V3_NODE_ID_LEN];
     uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN];
@@ -317,14 +329,29 @@ typedef struct {
     uint8_t total;
     uint8_t have_mask;
     uint64_t started_ms;
+    uint64_t progress_deadline_ms;
+    uint64_t absolute_deadline_ms;
     uint16_t part_len[TRUNK_MAX_FRAGS];
     uint8_t part[TRUNK_MAX_FRAGS][TRUNK_CHUNK_RX_MAX];
 } rx_slot_t;
 
-#define RX_SLOTS       2
-#define RX_TIMEOUT_MS  10000ULL
+#define RX_SLOTS 2
+#define COMPLETED_SLOTS 6
+
+typedef struct {
+    bool in_use;
+    bool addressed;
+    uint8_t version;
+    uint8_t src[LORA_TRUNK_V3_NODE_ID_LEN];
+    uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN];
+    uint8_t total;
+    uint64_t expires_ms;
+} completed_slot_t;
 
 static rx_slot_t s_rx_slots[RX_SLOTS];
+static completed_slot_t s_completed_slots[COMPLETED_SLOTS];
+
+static void abort_rx_slot(rx_slot_t *slot, uint8_t reason);
 
 static void IRAM_ATTR dio1_isr(void *arg)
 {
@@ -336,6 +363,10 @@ static void IRAM_ATTR dio1_isr(void *arg)
 static bool recover_radio(const char *reason)
 {
     ESP_LOGW(TAG, "radio recovery requested: %s", reason);
+    for (size_t i = 0; i < RX_SLOTS; ++i) {
+        abort_rx_slot(
+            &s_rx_slots[i], LORA_TRUNK_ABORT_RADIO_RESET);
+    }
     esp_err_t err = sx1262_recover();
     if (err == ESP_OK) {
         return true;
@@ -580,7 +611,7 @@ static void tx_scheduler_release(lora_tx_handle_t handle)
     lora_tx_scheduler_release(&s_tx_scheduler, handle);
     diag_sync_scheduler_locked();
     taskEXIT_CRITICAL(&s_gov_mux);
-    s_expected_ack_valid = false;
+    s_expected_control_valid = false;
 }
 
 static bool tx_scheduler_has_queued(void)
@@ -635,44 +666,111 @@ static bool build_tx_fragment(lora_tx_handle_t handle, uint8_t idx,
     }
     frame->len = (uint16_t)encoded_len;
     frame->want_ack = context->ack_requested;
-    s_expected_ack_valid = frame->want_ack;
-    if (s_expected_ack_valid) {
-        s_expected_ack_data = trunk;
+    s_expected_control_valid = frame->want_ack;
+    if (s_expected_control_valid) {
+        s_expected_control_data = trunk;
     }
     *out_total = total;
     return true;
 }
 
-/* Acks bypass the data queue entirely. When both ends have ARQ frames in
- * flight (any bidirectional exchange), an ack queued behind pending data would
- * wait on the peer's ack, which is itself queued behind the peer's data — a
- * mutual stall. Acks instead go into a small outbox the task transmits with
- * priority and no CAD (the peer is listening the instant its own TX ends). */
-#define ACK_OUTBOX 4
+/* Packet controls bypass the data queue. Cumulative bitmaps for the same
+ * transfer coalesce, and terminal COMPLETE/ABORT controls replace a pending
+ * bitmap so the bounded outbox cannot fill with per-fragment acknowledgements. */
+#define ACK_OUTBOX 6
 typedef struct {
     uint8_t version;
     uint8_t dst[LORA_TRUNK_V3_NODE_ID_LEN];
     uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN];
-    uint8_t idx;
+    lora_trunk_kind_t kind;
+    uint8_t value;
     uint8_t total;
 } ack_slot_t;
 static ack_slot_t s_ack_outbox[ACK_OUTBOX];
 static int s_ack_head, s_ack_count;
 
-static void queue_ack(const lora_trunk_frame_t *data)
+static unsigned control_rank(lora_trunk_kind_t kind)
 {
-    if (!data || s_ack_count >= ACK_OUTBOX) {
-        ESP_LOGW(TAG, "ack outbox full");
+    switch (kind) {
+    case LORA_TRUNK_KIND_COMPLETE:
+        return 3;
+    case LORA_TRUNK_KIND_ABORT:
+        return 2;
+    case LORA_TRUNK_KIND_BITMAP_ACK:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void queue_control_fields(
+    uint8_t version,
+    const uint8_t dst[LORA_TRUNK_V3_NODE_ID_LEN],
+    const uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN],
+    uint8_t total, lora_trunk_kind_t kind, uint8_t value)
+{
+    if (!dst || !transfer_id) {
+        return;
+    }
+    if (version == LORA_TRUNK_V3_VERSION) {
+        for (int offset = 0; offset < s_ack_count; ++offset) {
+            ack_slot_t *queued =
+                &s_ack_outbox[(s_ack_head + offset) % ACK_OUTBOX];
+            if (queued->version != version || queued->total != total ||
+                memcmp(queued->dst, dst, sizeof(queued->dst)) != 0 ||
+                memcmp(queued->transfer_id, transfer_id,
+                       sizeof(queued->transfer_id)) != 0) {
+                continue;
+            }
+            if (kind == LORA_TRUNK_KIND_BITMAP_ACK &&
+                queued->kind == LORA_TRUNK_KIND_BITMAP_ACK) {
+                queued->value |= value;
+            } else if (control_rank(kind) >
+                       control_rank(queued->kind)) {
+                queued->kind = kind;
+                queued->value = value;
+            }
+            return;
+        }
+    }
+    if (s_ack_count >= ACK_OUTBOX) {
+        ESP_LOGW(TAG, "control outbox full");
         return;
     }
     ack_slot_t *a = &s_ack_outbox[(s_ack_head + s_ack_count) % ACK_OUTBOX];
     memset(a, 0, sizeof(*a));
-    a->version = data->version;
-    memcpy(a->dst, data->source, sizeof(a->dst));
-    memcpy(a->transfer_id, data->transfer_id, sizeof(a->transfer_id));
-    a->idx = data->fragment_index;
-    a->total = data->fragment_total;
+    a->version = version;
+    memcpy(a->dst, dst, sizeof(a->dst));
+    memcpy(a->transfer_id, transfer_id, sizeof(a->transfer_id));
+    a->kind = kind;
+    a->value = value;
+    a->total = total;
     s_ack_count++;
+}
+
+static void queue_ack(const lora_trunk_frame_t *data)
+{
+    if (!data) {
+        return;
+    }
+    if (data->version == LORA_TRUNK_V2_VERSION) {
+        queue_control_fields(
+            data->version, data->source, data->transfer_id,
+            data->fragment_total, LORA_TRUNK_KIND_BITMAP_ACK,
+            data->fragment_index);
+    }
+}
+
+static void queue_v3_control(
+    const lora_trunk_frame_t *data, lora_trunk_kind_t kind,
+    uint8_t value)
+{
+    if (!data || data->version != LORA_TRUNK_V3_VERSION) {
+        return;
+    }
+    queue_control_fields(
+        data->version, data->source, data->transfer_id,
+        data->fragment_total, kind, value);
 }
 
 static bool transmit_ack_now(void)
@@ -692,22 +790,23 @@ static bool transmit_ack_now(void)
         memcpy(f + 8, a->dst, 4);
         f[12] = a->transfer_id[10];
         f[13] = a->transfer_id[11];
-        f[14] = a->idx;
+        f[14] = a->value;
         f[15] = a->total;
         frame_len = LORA_TRUNK_V2_HEADER_LEN;
     } else {
-        lora_trunk_frame_t ack = {
+        lora_trunk_frame_t control = {
             .version = LORA_TRUNK_V3_VERSION,
-            .kind = LORA_TRUNK_KIND_FRAGMENT_ACK,
+            .kind = a->kind,
             .capabilities = LORA_TRUNK_V3_CAP_PROTOCOL,
-            .fragment_index = a->idx,
+            .fragment_index = a->value,
             .fragment_total = a->total,
         };
-        memcpy(ack.source, s_node_id, sizeof(ack.source));
-        memcpy(ack.destination, a->dst, sizeof(ack.destination));
-        memcpy(ack.transfer_id, a->transfer_id, sizeof(ack.transfer_id));
+        memcpy(control.source, s_node_id, sizeof(control.source));
+        memcpy(control.destination, a->dst, sizeof(control.destination));
+        memcpy(control.transfer_id, a->transfer_id,
+               sizeof(control.transfer_id));
         if (!lora_trunk_v3_encode(
-                &ack, f, sizeof(f), &frame_len)) {
+                &control, f, sizeof(f), &frame_len)) {
             s_ack_head = (s_ack_head + 1) % ACK_OUTBOX;
             s_ack_count--;
             return false;
@@ -718,7 +817,17 @@ static bool transmit_ack_now(void)
     if (sx1262_transmit(f, frame_len) == ESP_OK) {
         diag_inc(&s_diag.tx_attempts);
         diag_inc(&s_diag.ack_tx);
-        ESP_LOGI(TAG, "v%u ack TX idx=%u", a->version, a->idx);
+        if (a->version == LORA_TRUNK_V3_VERSION) {
+            if (a->kind == LORA_TRUNK_KIND_BITMAP_ACK) {
+                diag_inc(&s_diag.bitmap_acks);
+            } else if (a->kind == LORA_TRUNK_KIND_COMPLETE) {
+                diag_inc(&s_diag.complete_acks);
+            } else if (a->kind == LORA_TRUNK_KIND_ABORT) {
+                diag_inc(&s_diag.transfer_aborts_tx);
+            }
+        }
+        ESP_LOGI(TAG, "v%u control TX kind=%u value=0x%02x",
+                 a->version, a->kind, a->value);
         return true;
     }
     recover_radio("ACK transmit command");
@@ -759,38 +868,172 @@ static void learn_authenticated_neighbor(
     bitchat_packet_free(&packet);
 }
 
+static bool same_transfer(
+    uint8_t version, const uint8_t *source, const uint8_t *transfer_id,
+    const lora_trunk_frame_t *frame)
+{
+    return version == frame->version &&
+           memcmp(source, frame->source, LORA_TRUNK_V3_NODE_ID_LEN) == 0 &&
+           memcmp(transfer_id, frame->transfer_id,
+                  LORA_TRUNK_V3_TRANSFER_ID_LEN) == 0;
+}
+
+static completed_slot_t *completed_transfer(
+    const lora_trunk_frame_t *frame, uint64_t now_ms)
+{
+    for (size_t i = 0; i < COMPLETED_SLOTS; ++i) {
+        completed_slot_t *completed = &s_completed_slots[i];
+        if (completed->in_use && now_ms >= completed->expires_ms) {
+            completed->in_use = false;
+        }
+        if (completed->in_use &&
+            same_transfer(
+                completed->version, completed->src,
+                completed->transfer_id, frame)) {
+            return completed;
+        }
+    }
+    return NULL;
+}
+
+static void remember_completed_transfer(
+    const lora_trunk_frame_t *frame, bool addressed,
+    uint64_t expires_ms)
+{
+    completed_slot_t *slot = NULL;
+    for (size_t i = 0; i < COMPLETED_SLOTS; ++i) {
+        completed_slot_t *candidate = &s_completed_slots[i];
+        if (!candidate->in_use) {
+            slot = candidate;
+            break;
+        }
+        if (!slot || candidate->expires_ms < slot->expires_ms) {
+            slot = candidate;
+        }
+    }
+    memset(slot, 0, sizeof(*slot));
+    slot->in_use = true;
+    slot->addressed = addressed;
+    slot->version = frame->version;
+    memcpy(slot->src, frame->source, sizeof(slot->src));
+    memcpy(slot->transfer_id, frame->transfer_id,
+           sizeof(slot->transfer_id));
+    slot->total = frame->fragment_total;
+    slot->expires_ms = expires_ms;
+}
+
+static void abort_rx_slot(rx_slot_t *slot, uint8_t reason)
+{
+    if (!slot || !slot->in_use) {
+        return;
+    }
+    if (slot->addressed &&
+        slot->version == LORA_TRUNK_V3_VERSION) {
+        queue_control_fields(
+            slot->version, slot->src, slot->transfer_id, slot->total,
+            LORA_TRUNK_KIND_ABORT, reason);
+    }
+    memset(slot, 0, sizeof(*slot));
+}
+
+static void expire_reassembly(uint64_t now_ms)
+{
+    for (size_t i = 0; i < RX_SLOTS; ++i) {
+        rx_slot_t *slot = &s_rx_slots[i];
+        if (slot->in_use &&
+            (now_ms >= slot->progress_deadline_ms ||
+             now_ms >= slot->absolute_deadline_ms)) {
+            abort_rx_slot(slot, LORA_TRUNK_ABORT_RETRY_EXHAUSTED);
+            diag_inc(&s_diag.reassembly_expiry);
+        }
+    }
+}
+
 static void reassemble_data(
-    const lora_trunk_frame_t *frame, int16_t rssi, int8_t snr)
+    const lora_trunk_frame_t *frame, bool addressed_to_us,
+    int16_t rssi, int8_t snr)
 {
     if (!frame || frame->payload_len == 0 ||
         frame->payload_len > TRUNK_CHUNK_RX_MAX ||
         frame->fragment_total > TRUNK_MAX_FRAGS) {
         return;
     }
+    if (frame->version == LORA_TRUNK_V3_VERSION &&
+        frame->fragment_index + 1u < frame->fragment_total &&
+        frame->payload_len != TRUNK_CHUNK_TX) {
+        queue_v3_control(
+            frame, LORA_TRUNK_KIND_ABORT,
+            LORA_TRUNK_ABORT_INVALID_LENGTH);
+        diag_inc(&s_diag.invalid_reassemblies);
+        return;
+    }
+
     uint64_t now = esp_timer_get_time() / 1000ULL;
-    rx_slot_t *slot = NULL, *free_slot = NULL, *oldest = &s_rx_slots[0];
+    lora_reliability_timing_t timing;
+    if (!trunk_reliability_timing(frame->fragment_total, &timing)) {
+        return;
+    }
+    expire_reassembly(now);
+
+    completed_slot_t *completed = completed_transfer(frame, now);
+    if (completed) {
+        if (completed->total != frame->fragment_total) {
+            if (addressed_to_us &&
+                frame->version == LORA_TRUNK_V3_VERSION) {
+                queue_v3_control(
+                    frame, LORA_TRUNK_KIND_ABORT,
+                    LORA_TRUNK_ABORT_INVALID_LENGTH);
+            }
+            diag_inc(&s_diag.invalid_reassemblies);
+            return;
+        }
+        diag_inc(&s_diag.duplicate_transfers);
+        if (completed->addressed && addressed_to_us &&
+            frame->version == LORA_TRUNK_V3_VERSION) {
+            queue_v3_control(
+                frame, LORA_TRUNK_KIND_COMPLETE,
+                lora_fragment_mask(frame->fragment_total));
+        } else if (
+            frame->version == LORA_TRUNK_V2_VERSION &&
+            (frame->flags & LORA_TRUNK_V3_FLAG_ACK_REQUESTED) != 0) {
+            queue_ack(frame);
+        }
+        return;
+    }
+
+    rx_slot_t *slot = NULL;
+    rx_slot_t *free_slot = NULL;
+    uint8_t slots_in_use = 0;
     for (size_t i = 0; i < RX_SLOTS; ++i) {
-        rx_slot_t *s = &s_rx_slots[i];
-        if (s->in_use && now - s->started_ms > RX_TIMEOUT_MS) {
-            s->in_use = false;
-            diag_inc(&s_diag.reassembly_expiry);
-        }
-        if (s->in_use && s->version == frame->version &&
-            memcmp(s->src, frame->source, sizeof(s->src)) == 0 &&
-            memcmp(s->transfer_id, frame->transfer_id,
-                   sizeof(s->transfer_id)) == 0) {
-            slot = s;
-        } else if (!s->in_use && !free_slot) {
-            free_slot = s;
-        }
-        if (s->started_ms < oldest->started_ms) {
-            oldest = s;
+        rx_slot_t *candidate = &s_rx_slots[i];
+        if (candidate->in_use) {
+            slots_in_use++;
+            if (same_transfer(
+                    candidate->version, candidate->src,
+                    candidate->transfer_id, frame)) {
+                slot = candidate;
+            }
+        } else if (!free_slot) {
+            free_slot = candidate;
         }
     }
     if (!slot) {
-        slot = free_slot ? free_slot : oldest;
+        if (!free_slot ||
+            !lora_reassembly_admit(
+                addressed_to_us, slots_in_use, RX_SLOTS)) {
+            if (addressed_to_us &&
+                frame->version == LORA_TRUNK_V3_VERSION) {
+                queue_v3_control(
+                    frame, LORA_TRUNK_KIND_ABORT,
+                    LORA_TRUNK_ABORT_RESOURCE_PRESSURE);
+            }
+            diag_inc(&s_diag.resource_aborts);
+            return;
+        }
+        slot = free_slot;
         memset(slot, 0, sizeof(*slot));
         slot->in_use = true;
+        slot->addressed = addressed_to_us;
         slot->version = frame->version;
         memcpy(slot->src, frame->source, sizeof(slot->src));
         memcpy(slot->transfer_id, frame->transfer_id,
@@ -798,39 +1041,94 @@ static void reassemble_data(
         slot->capabilities = frame->capabilities;
         slot->total = frame->fragment_total;
         slot->started_ms = now;
+        slot->progress_deadline_ms =
+            now + timing.progress_timeout_ms;
+        slot->absolute_deadline_ms =
+            now + timing.absolute_timeout_ms;
     }
     if (slot->total != frame->fragment_total ||
-        slot->capabilities != frame->capabilities) {
-        diag_inc(&s_diag.malformed_frames);
+        slot->capabilities != frame->capabilities ||
+        slot->addressed != addressed_to_us) {
+        abort_rx_slot(slot, LORA_TRUNK_ABORT_INVALID_LENGTH);
+        diag_inc(&s_diag.invalid_reassemblies);
         return;
     }
-    slot->part_len[frame->fragment_index] = frame->payload_len;
-    memcpy(slot->part[frame->fragment_index], frame->payload,
-           frame->payload_len);
-    slot->have_mask |= 1u << frame->fragment_index;
 
-    uint8_t want = (uint8_t)((1u << frame->fragment_total) - 1);
-    if ((slot->have_mask & want) != want) {
+    uint8_t bit = (uint8_t)(1u << frame->fragment_index);
+    if ((slot->have_mask & bit) != 0) {
+        diag_inc(&s_diag.duplicate_fragments);
+        if (slot->part_len[frame->fragment_index] != frame->payload_len ||
+            memcmp(slot->part[frame->fragment_index], frame->payload,
+                   frame->payload_len) != 0) {
+            abort_rx_slot(slot, LORA_TRUNK_ABORT_INVALID_LENGTH);
+            diag_inc(&s_diag.invalid_reassemblies);
+            return;
+        }
+    } else {
+        slot->part_len[frame->fragment_index] = frame->payload_len;
+        memcpy(slot->part[frame->fragment_index], frame->payload,
+               frame->payload_len);
+        slot->have_mask |= bit;
+        uint64_t refreshed = now + timing.progress_timeout_ms;
+        slot->progress_deadline_ms =
+            refreshed < slot->absolute_deadline_ms
+                ? refreshed
+                : slot->absolute_deadline_ms;
+    }
+
+    uint8_t wanted = lora_fragment_mask(frame->fragment_total);
+    if ((slot->have_mask & wanted) != wanted) {
+        if (addressed_to_us &&
+            frame->version == LORA_TRUNK_V3_VERSION) {
+            queue_v3_control(
+                frame, LORA_TRUNK_KIND_BITMAP_ACK, slot->have_mask);
+        } else if (
+            frame->version == LORA_TRUNK_V2_VERSION &&
+            (frame->flags & LORA_TRUNK_V3_FLAG_ACK_REQUESTED) != 0) {
+            queue_ack(frame);
+        }
         return;
     }
 
     static uint8_t packet[BITCHAT_BLE_MAX_PACKET_SIZE];
-    uint16_t plen = 0;
-    for (uint8_t i = 0; i < frame->fragment_total; ++i) {
-        if (plen + slot->part_len[i] > sizeof(packet)) {
-            slot->in_use = false;
+    uint16_t packet_len = 0;
+    for (uint8_t index = 0; index < frame->fragment_total; ++index) {
+        if (packet_len + slot->part_len[index] > sizeof(packet)) {
+            abort_rx_slot(slot, LORA_TRUNK_ABORT_INVALID_LENGTH);
+            diag_inc(&s_diag.invalid_reassemblies);
             return;
         }
-        memcpy(packet + plen, slot->part[i], slot->part_len[i]);
-        plen += slot->part_len[i];
+        memcpy(packet + packet_len, slot->part[index],
+               slot->part_len[index]);
+        packet_len += slot->part_len[index];
     }
-    slot->in_use = false;
+    if (!lora_bitchat_packet_length_valid(
+            packet, packet_len, sizeof(packet))) {
+        abort_rx_slot(slot, LORA_TRUNK_ABORT_INVALID_LENGTH);
+        diag_inc(&s_diag.invalid_reassemblies);
+        return;
+    }
 
-    learn_authenticated_neighbor(frame, packet, plen, now);
+    remember_completed_transfer(
+        frame, addressed_to_us,
+        now + timing.completed_retention_ms);
+    memset(slot, 0, sizeof(*slot));
+    if (addressed_to_us &&
+        frame->version == LORA_TRUNK_V3_VERSION) {
+        queue_v3_control(
+            frame, LORA_TRUNK_KIND_COMPLETE, wanted);
+    } else if (
+        frame->version == LORA_TRUNK_V2_VERSION &&
+        (frame->flags & LORA_TRUNK_V3_FLAG_ACK_REQUESTED) != 0) {
+        queue_ack(frame);
+    }
+
+    learn_authenticated_neighbor(frame, packet, packet_len, now);
     diag_inc(&s_diag.completed_packets);
     ESP_LOGI(TAG, "trunk v%u RX packet len=%u rssi=%d snr=%d frags=%u",
-             frame->version, plen, rssi, snr, frame->fragment_total);
-    bitle_mesh_inbound(BITLE_LORA_LINK_HANDLE, packet, plen);
+             frame->version, packet_len, rssi, snr,
+             frame->fragment_total);
+    bitle_mesh_inbound(BITLE_LORA_LINK_HANDLE, packet, packet_len);
 }
 
 static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
@@ -855,17 +1153,35 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
     ESP_LOGI(TAG, "trunk v%u raw RX len=%u rssi=%d snr=%d kind=%u",
              frame.version, len, rssi, snr, frame.kind);
 
-    if (frame.kind == LORA_TRUNK_KIND_FRAGMENT_ACK) {
-        /* v3 is the only originated version. Shared-channel ACKs for other
-         * senders are normal; only an ACK addressed to us but not matching the
-         * in-flight tuple is a rejected ACK. */
+    if (frame.kind != LORA_TRUNK_KIND_DATA) {
+        /* Shared-channel controls for other senders are normal. A control
+         * addressed to us must match the selected peer and the complete
+         * transfer tuple before it can mutate selective-repeat state. */
         if (frame.version == LORA_TRUNK_V3_VERSION &&
             memcmp(frame.destination, s_node_id, sizeof(s_node_id)) == 0) {
-            if (s_expected_ack_valid &&
-                lora_trunk_v3_ack_matches(&s_expected_ack_data, &frame)) {
-                s_ack_seen = true;
-                diag_inc(&s_diag.ack_rx);
-                ESP_LOGI(TAG, "v3 ack RX idx=%u", frame.fragment_index);
+            if (s_expected_control_valid &&
+                lora_trunk_v3_control_matches(
+                    &s_expected_control_data, &frame)) {
+                bool accepted = false;
+                if (frame.kind == LORA_TRUNK_KIND_BITMAP_ACK) {
+                    accepted = lora_selective_tx_apply_bitmap(
+                        &s_selective_tx, frame.fragment_index);
+                } else if (frame.kind == LORA_TRUNK_KIND_COMPLETE) {
+                    accepted = lora_selective_tx_apply_complete(
+                        &s_selective_tx, frame.fragment_index);
+                } else if (frame.kind == LORA_TRUNK_KIND_ABORT) {
+                    lora_selective_tx_apply_abort(
+                        &s_selective_tx, frame.fragment_index);
+                    diag_inc(&s_diag.transfer_aborts_rx);
+                    accepted = true;
+                }
+                if (accepted) {
+                    s_feedback_seen = true;
+                    diag_inc(&s_diag.ack_rx);
+                    ESP_LOGI(TAG,
+                             "v3 control RX kind=%u value=0x%02x",
+                             frame.kind, frame.fragment_index);
+                }
             } else {
                 diag_inc(&s_diag.rejected_acks);
             }
@@ -888,13 +1204,7 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
         return;
     }
 
-    /* v3 broadcasts can never request ACKs (enforced by the parser). The v2
-     * receive-only migration path preserves legacy broadcast ACK behavior. */
-    if ((frame.flags & LORA_TRUNK_V3_FLAG_ACK_REQUESTED) != 0 &&
-        (frame.version == LORA_TRUNK_V2_VERSION || addressed_to_us)) {
-        queue_ack(&frame);
-    }
-    reassemble_data(&frame, rssi, snr);
+    reassemble_data(&frame, addressed_to_us, rssi, snr);
 }
 
 /* Neighbor discovery: our signed announce over the trunk, so two nodes
@@ -911,8 +1221,28 @@ static void drop_tx_packet(lora_tx_handle_t *handle, bool *have_pending)
     *have_pending = false;
 }
 
-/* Releases a completed packet, or builds the next fragment while retaining
- * ownership of the same static-pool descriptor. */
+static void queue_sender_abort(uint8_t reason)
+{
+    if (!s_expected_control_valid) {
+        return;
+    }
+    queue_control_fields(
+        LORA_TRUNK_V3_VERSION,
+        s_expected_control_data.destination,
+        s_expected_control_data.transfer_id,
+        s_expected_control_data.fragment_total,
+        LORA_TRUNK_KIND_ABORT, reason);
+}
+
+static void abort_tx_packet(
+    lora_tx_handle_t *handle, bool *have_pending, uint8_t reason)
+{
+    queue_sender_abort(reason);
+    drop_tx_packet(handle, have_pending);
+}
+
+/* Broadcasts retain one-pass fragment sequencing. Addressed transfers select
+ * fragments through the portable cumulative-bitmap state machine. */
 static bool advance_tx_packet(lora_tx_handle_t *handle, uint8_t *fragment_idx,
                               uint8_t fragment_total, lora_frame_t *frame)
 {
@@ -932,6 +1262,24 @@ static bool advance_tx_packet(lora_tx_handle_t *handle, uint8_t *fragment_idx,
     return true;
 }
 
+static bool prepare_selective_fragment(
+    lora_tx_handle_t handle, lora_frame_t *frame,
+    uint8_t expected_total, uint8_t *out_index)
+{
+    int next = lora_selective_tx_next_fragment(&s_selective_tx);
+    if (next < 0) {
+        return false;
+    }
+    uint8_t checked_total = 0;
+    if (!build_tx_fragment(
+            handle, (uint8_t)next, frame, &checked_total) ||
+        checked_total != expected_total) {
+        return false;
+    }
+    *out_index = (uint8_t)next;
+    return true;
+}
+
 static void lora_task(void *arg)
 {
     (void)arg;
@@ -941,7 +1289,6 @@ static void lora_task(void *arg)
     uint8_t fragment_total = 0;
     bool have_pending = false;
     int cad_tries = 0;
-    int arq_sends = 0;
     bool awaiting_tx_done = false;
     bool tx_is_ack = false;
     bool awaiting_cad = false;
@@ -949,6 +1296,8 @@ static void lora_task(void *arg)
     unsigned ack_burst = 0;
     uint64_t tx_watchdog_deadline = 0;
     uint64_t ack_deadline = 0;
+    uint64_t transfer_deadline = 0;
+    lora_reliability_timing_t transfer_timing = {0};
     uint64_t next_beacon_ms =
         BEACON_FIRST_MS + (esp_random() % BEACON_START_JITTER_MS);
     uint64_t next_diag_ms = 60000ULL;
@@ -965,6 +1314,7 @@ static void lora_task(void *arg)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
 
         uint64_t now = esp_timer_get_time() / 1000ULL;
+        expire_reassembly(now);
         if (now >= next_beacon_ms) {
             next_beacon_ms =
                 now + BEACON_INTERVAL_MS -
@@ -1018,15 +1368,25 @@ static void lora_task(void *arg)
                 memcpy(probe + PKT_SENDER_OFF,
                        noise_get_local_peer_id(), 8);
                 memcpy(probe + 22, recipient, sizeof(recipient));
-                ESP_LOGI(TAG,
-                         "diagnostic smoke enqueue len=%u expected_frags=%u "
-                         "addressed=1",
-                         probe_len,
-                         (probe_len + TRUNK_CHUNK_TX - 1) /
-                             TRUNK_CHUNK_TX);
-                lora_link_send(BITLE_LORA_LINK_HANDLE, probe, probe_len);
-                smoke_index++;
-                next_smoke_ms = now + 12000ULL;
+                bitle_link_send_result_t result =
+                    lora_link_send(
+                        BITLE_LORA_LINK_HANDLE, probe, probe_len);
+                if (result == BITLE_LINK_SEND_ACCEPTED) {
+                    ESP_LOGI(
+                        TAG,
+                        "diagnostic smoke enqueue len=%u expected_frags=%u "
+                        "addressed=1",
+                        probe_len,
+                        (probe_len + TRUNK_CHUNK_TX - 1) /
+                            TRUNK_CHUNK_TX);
+                    smoke_index++;
+                } else {
+                    ESP_LOGW(
+                        TAG,
+                        "diagnostic smoke deferred len=%u result=%u",
+                        probe_len, result);
+                }
+                next_smoke_ms = now + 3000ULL;
             }
         }
 #endif
@@ -1041,7 +1401,9 @@ static void lora_task(void *arg)
                      "busy_tmo=%lu recover=%lu/%lu tx_watchdog=%lu "
                      "admit=%lu/%lu/%lu/%lu defer=%lu/%lu/%lu/%lu "
                      "policy=%lu release=%lu cancel=%lu malformed=%lu "
-                     "unsupported=%lu ack_reject=%lu neighbors=%lu collision=%lu",
+                     "unsupported=%lu ack_reject=%lu neighbors=%lu collision=%lu "
+                     "bitmap=%lu final=%lu dup=%lu/%lu abort=%lu/%lu "
+                     "invalid=%lu resource=%lu",
                      (unsigned long)diag.raw_rx_frames,
                      (unsigned long)diag.crc_errors,
                      (unsigned long)diag.tx_attempts,
@@ -1077,7 +1439,15 @@ static void lora_task(void *arg)
                      (unsigned long)diag.unsupported_versions,
                      (unsigned long)diag.rejected_acks,
                      (unsigned long)diag.neighbor_count,
-                     (unsigned long)diag.neighbor_collisions);
+                     (unsigned long)diag.neighbor_collisions,
+                     (unsigned long)diag.bitmap_acks,
+                     (unsigned long)diag.complete_acks,
+                     (unsigned long)diag.duplicate_fragments,
+                     (unsigned long)diag.duplicate_transfers,
+                     (unsigned long)diag.transfer_aborts_tx,
+                     (unsigned long)diag.transfer_aborts_rx,
+                     (unsigned long)diag.invalid_reassemblies,
+                     (unsigned long)diag.resource_aborts);
             next_diag_ms = now + 60000ULL;
         }
 
@@ -1107,33 +1477,35 @@ static void lora_task(void *arg)
                 if (!resume_rx_or_recover("TX_DONE resume RX")) {
                     tx_is_ack = false;
                     if (have_pending) {
-                        drop_tx_packet(&packet_handle, &have_pending);
+                        abort_tx_packet(
+                            &packet_handle, &have_pending,
+                            LORA_TRUNK_ABORT_RADIO_RESET);
                     }
                     break;
                 }
                 if (tx_is_ack) {
-                    /* our ack went out; the interleave delayed any pending
-                     * data frame's ack wait, so extend its deadline */
+                    /* A local control delayed packet feedback processing. */
                     tx_is_ack = false;
                     if (awaiting_ack) {
                         ack_deadline +=
                             trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN) + 300;
                     }
                 } else if (have_pending && pending.want_ack) {
-                    /* wait long enough for the peer's ack (its airtime plus
-                     * CAD/scheduling slack) before retransmitting */
-                    awaiting_ack = true;
-                    ack_deadline = esp_timer_get_time() / 1000ULL +
-                                   trunk_airtime_ms(
-                                       LORA_TRUNK_V3_HEADER_LEN) +
-                                   ARQ_MARGIN_MS;
+                    if (prepare_selective_fragment(
+                            packet_handle, &pending, fragment_total,
+                            &fragment_idx)) {
+                        cad_tries = 0;
+                    } else {
+                        awaiting_ack = true;
+                        ack_deadline =
+                            esp_timer_get_time() / 1000ULL +
+                            transfer_timing.feedback_wait_ms;
+                    }
                 } else {
                     have_pending = advance_tx_packet(
                         &packet_handle, &fragment_idx, fragment_total,
                         &pending);
                     cad_tries = 0;
-                    arq_sends = 0;
-                    s_ack_seen = false;
                 }
                 break;
             case SX1262_EVT_CAD_CLEAR:
@@ -1155,38 +1527,67 @@ static void lora_task(void *arg)
                 } else if (have_pending) {
                     if (sx1262_transmit(pending.data, pending.len) == ESP_OK) {
                         diag_inc(&s_diag.tx_attempts);
-                        if (arq_sends > 0) {
+                        if (pending.want_ack &&
+                            s_selective_tx.round_index > 0) {
                             diag_inc(&s_diag.retries);
+                        }
+                        if (pending.want_ack &&
+                            !lora_selective_tx_note_sent(
+                                &s_selective_tx, fragment_idx)) {
+                            abort_tx_packet(
+                                &packet_handle, &have_pending,
+                                LORA_TRUNK_ABORT_INVALID_LENGTH);
+                            resume_rx_or_recover(
+                                "selective state resume RX");
+                            break;
                         }
                         awaiting_tx_done = true;
                         tx_is_ack = false;
                         tx_watchdog_deadline =
                             esp_timer_get_time() / 1000ULL +
                             sx1262_tx_watchdog_ms(pending.len);
-                        arq_sends++;
                         ack_burst = 0;
                     } else {
-                        drop_tx_packet(&packet_handle, &have_pending);
+                        abort_tx_packet(
+                            &packet_handle, &have_pending,
+                            LORA_TRUNK_ABORT_RADIO_RESET);
                         recover_radio("data transmit command");
                     }
                 }
                 break;
             case SX1262_EVT_CAD_BUSY:
                 awaiting_cad = false;
-                if (have_pending && ++cad_tries <= CAD_RETRIES) {
+                if (have_pending &&
+                    (pending.want_ack || ++cad_tries <= CAD_RETRIES)) {
+                    /* An addressed transfer owns a bounded absolute deadline;
+                     * temporary channel occupancy must not discard it after a
+                     * small fixed number of CAD results. Return to RX during
+                     * backoff so packet feedback remains observable, then
+                     * retry until COMPLETE, ABORT, or the transfer deadline. */
+                    if (!resume_rx_or_recover(
+                            "CAD busy backoff resume RX")) {
+                        abort_tx_packet(
+                            &packet_handle, &have_pending,
+                            LORA_TRUNK_ABORT_RADIO_RESET);
+                        break;
+                    }
                     vTaskDelay(pdMS_TO_TICKS(CAD_BACKOFF_MIN +
                                              (esp_random() % CAD_BACKOFF_SPAN)));
                     if (sx1262_start_cad() == ESP_OK) {
                         awaiting_cad = true;
                     } else {
-                        drop_tx_packet(&packet_handle, &have_pending);
+                        abort_tx_packet(
+                            &packet_handle, &have_pending,
+                            LORA_TRUNK_ABORT_RADIO_RESET);
                         recover_radio("CAD retry command");
                     }
                 } else {
                     /* Channel persistently busy: reject the complete packet;
                      * sending only its earlier fragments cannot complete. */
                     if (have_pending) {
-                        drop_tx_packet(&packet_handle, &have_pending);
+                        abort_tx_packet(
+                            &packet_handle, &have_pending,
+                            LORA_TRUNK_ABORT_RESOURCE_PRESSURE);
                     }
                     resume_rx_or_recover("CAD busy resume RX");
                 }
@@ -1194,20 +1595,33 @@ static void lora_task(void *arg)
             case SX1262_EVT_TIMEOUT:
                 {
                 bool timed_out_ack = tx_is_ack;
+                bool data_was_waiting = awaiting_ack;
                 diag_inc(&s_diag.tx_timeouts);
                 awaiting_tx_done = false;
                 tx_watchdog_deadline = 0;
                 tx_is_ack = false;
                 awaiting_ack = false;
-                /* A radio timeout is an expected, separately counted delivery
-                 * failure. Re-enter RX and let an ack-requested data frame use
-                 * its remaining ARQ attempts. */
                 if (!resume_rx_or_recover("radio TX timeout")) {
                     if (have_pending) {
-                        drop_tx_packet(&packet_handle, &have_pending);
+                        abort_tx_packet(
+                            &packet_handle, &have_pending,
+                            LORA_TRUNK_ABORT_RADIO_RESET);
                     }
+                } else if (timed_out_ack && data_was_waiting) {
+                    awaiting_ack = true;
+                    ack_deadline +=
+                        transfer_timing.feedback_wait_ms;
                 } else if (!timed_out_ack && have_pending &&
-                           (!pending.want_ack || arq_sends >= ARQ_TRIES)) {
+                           pending.want_ack) {
+                    if (!prepare_selective_fragment(
+                            packet_handle, &pending, fragment_total,
+                            &fragment_idx)) {
+                        awaiting_ack = true;
+                        ack_deadline =
+                            esp_timer_get_time() / 1000ULL +
+                            transfer_timing.feedback_wait_ms;
+                    }
+                } else if (!timed_out_ack && have_pending) {
                     drop_tx_packet(&packet_handle, &have_pending);
                 }
                 break;
@@ -1224,11 +1638,12 @@ static void lora_task(void *arg)
                 awaiting_ack = false;
                 tx_is_ack = false;
                 tx_watchdog_deadline = 0;
-                if (!recover_radio("IRQ status command")) {
-                    if (have_pending) {
-                        drop_tx_packet(&packet_handle, &have_pending);
-                    }
+                if (have_pending) {
+                    abort_tx_packet(
+                        &packet_handle, &have_pending,
+                        LORA_TRUNK_ABORT_RADIO_RESET);
                 }
+                recover_radio("IRQ status command");
                 break;
             default:
                 break;
@@ -1262,44 +1677,63 @@ static void lora_task(void *arg)
             awaiting_ack = false;
             tx_is_ack = false;
             tx_watchdog_deadline = 0;
-            if (!recover_radio("software TX watchdog")) {
-                if (have_pending) {
-                    drop_tx_packet(&packet_handle, &have_pending);
+            if (have_pending) {
+                abort_tx_packet(
+                    &packet_handle, &have_pending,
+                    LORA_TRUNK_ABORT_RADIO_RESET);
+            }
+            recover_radio("software TX watchdog");
+        }
+
+        /* Packet-level selective repeat resolves cumulative feedback only
+         * after sending every currently missing fragment in the round. */
+        if (have_pending && pending.want_ack &&
+            (s_selective_tx.complete || s_selective_tx.aborted)) {
+            if (s_selective_tx.complete) {
+                ESP_LOGI(TAG, "trunk transfer COMPLETE rounds=%u",
+                         s_selective_tx.round_index + 1u);
+            } else {
+                ESP_LOGW(TAG, "trunk transfer ABORT reason=%u",
+                         s_selective_tx.abort_reason);
+            }
+            awaiting_ack = false;
+            awaiting_cad = false;
+            s_feedback_seen = false;
+            drop_tx_packet(&packet_handle, &have_pending);
+        } else if (awaiting_ack && have_pending) {
+            uint64_t now2 = esp_timer_get_time() / 1000ULL;
+            if (now2 >= ack_deadline) {
+                if (!s_feedback_seen) {
+                    diag_inc(&s_diag.ack_misses);
+                }
+                s_feedback_seen = false;
+                awaiting_ack = false;
+                if (lora_selective_tx_next_round(
+                        &s_selective_tx,
+                        LORA_SELECTIVE_REPEAT_ROUNDS) &&
+                    prepare_selective_fragment(
+                        packet_handle, &pending, fragment_total,
+                        &fragment_idx)) {
+                    cad_tries = 0;
+                } else {
+                    diag_inc(&s_diag.retry_exhaustion);
+                    abort_tx_packet(
+                        &packet_handle, &have_pending,
+                        LORA_TRUNK_ABORT_RETRY_EXHAUSTED);
                 }
             }
         }
 
-        /* ARQ: resolve the ack wait for the in-flight frame. */
-        if (awaiting_ack && have_pending) {
-            uint64_t now2 = esp_timer_get_time() / 1000ULL;
-            if (s_ack_seen) {
-                s_ack_seen = false;
-                s_expected_ack_valid = false;
-                awaiting_ack = false;
-                have_pending = advance_tx_packet(
-                    &packet_handle, &fragment_idx, fragment_total, &pending);
-                cad_tries = 0;
-                arq_sends = 0;
-            } else if (now2 >= ack_deadline) {
-                diag_inc(&s_diag.ack_misses);
-                awaiting_ack = false;
-                if (arq_sends < ARQ_TRIES) {
-                    cad_tries = 0;
-                    if (sx1262_start_cad() == ESP_OK) {
-                        awaiting_cad = true;   /* retransmit */
-                    } else {
-                        drop_tx_packet(&packet_handle, &have_pending);
-                        recover_radio("ARQ CAD command");
-                    }
-                } else {
-                    diag_inc(&s_diag.retry_exhaustion);
-                    ESP_LOGW(TAG,
-                             "trunk frame lost after %d sends idx=%u",
-                             ARQ_TRIES,
-                             s_expected_ack_data.fragment_index);
-                    drop_tx_packet(&packet_handle, &have_pending);
-                }
-            }
+        uint64_t transfer_now = esp_timer_get_time() / 1000ULL;
+        if (have_pending && pending.want_ack &&
+            transfer_deadline != 0 &&
+            transfer_now >= transfer_deadline) {
+            diag_inc(&s_diag.retry_exhaustion);
+            awaiting_ack = false;
+            awaiting_cad = false;
+            abort_tx_packet(
+                &packet_handle, &have_pending,
+                LORA_TRUNK_ABORT_RETRY_EXHAUSTED);
         }
 
         /* Re-arm a pending data frame that was stranded idle in every wait
@@ -1311,7 +1745,9 @@ static void lora_task(void *arg)
             if (sx1262_start_cad() == ESP_OK) {
                 awaiting_cad = true;
             } else {
-                drop_tx_packet(&packet_handle, &have_pending);
+                abort_tx_packet(
+                    &packet_handle, &have_pending,
+                    LORA_TRUNK_ABORT_RADIO_RESET);
                 recover_radio("pending CAD command");
             }
         }
@@ -1325,13 +1761,29 @@ static void lora_task(void *arg)
                 drop_tx_packet(&packet_handle, &have_pending);
                 continue;
             }
+            if (pending.want_ack &&
+                (!lora_selective_tx_init(
+                     &s_selective_tx, fragment_total) ||
+                 !trunk_reliability_timing(
+                     fragment_total, &transfer_timing))) {
+                abort_tx_packet(
+                    &packet_handle, &have_pending,
+                    LORA_TRUNK_ABORT_INVALID_LENGTH);
+                continue;
+            }
             cad_tries = 0;
-            arq_sends = 0;
-            s_ack_seen = false;
+            s_feedback_seen = false;
+            transfer_deadline =
+                pending.want_ack
+                    ? esp_timer_get_time() / 1000ULL +
+                          transfer_timing.absolute_timeout_ms
+                    : 0;
             if (sx1262_start_cad() == ESP_OK) {
                 awaiting_cad = true;
             } else {
-                drop_tx_packet(&packet_handle, &have_pending);
+                abort_tx_packet(
+                    &packet_handle, &have_pending,
+                    LORA_TRUNK_ABORT_RADIO_RESET);
                 recover_radio("dequeue CAD command");
             }
         }
@@ -1371,8 +1823,14 @@ void bitle_lora_shutdown(void)
     }
     taskENTER_CRITICAL(&s_gov_mux);
     lora_tx_scheduler_cancel_all(&s_tx_scheduler);
+    memset(s_tx_context, 0, sizeof(s_tx_context));
     diag_sync_scheduler_locked();
     taskEXIT_CRITICAL(&s_gov_mux);
+    memset(s_rx_slots, 0, sizeof(s_rx_slots));
+    memset(s_completed_slots, 0, sizeof(s_completed_slots));
+    memset(&s_selective_tx, 0, sizeof(s_selective_tx));
+    s_expected_control_valid = false;
+    s_feedback_seen = false;
     s_ack_head = 0;
     s_ack_count = 0;
 }
@@ -1500,9 +1958,13 @@ esp_err_t bitle_lora_init(void)
     s_transfer_counter = 0;
     memset(s_tx_context, 0, sizeof(s_tx_context));
     memset(s_rx_slots, 0, sizeof(s_rx_slots));
+    memset(s_completed_slots, 0, sizeof(s_completed_slots));
     lora_trunk_neighbor_table_init(&s_neighbors);
-    s_expected_ack_valid = false;
-    s_ack_seen = false;
+    s_expected_control_valid = false;
+    s_feedback_seen = false;
+    memset(&s_selective_tx, 0, sizeof(s_selective_tx));
+    s_ack_head = 0;
+    s_ack_count = 0;
 
     /* Modem params for the airtime governor; start the bucket full so a
      * quiet node can transmit immediately. */

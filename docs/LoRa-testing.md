@@ -22,6 +22,14 @@ same-transfer isolation between senders, zero-ACK broadcast delivery to four
 nodes, neighbor collision quarantine, expiry, bounded eviction, and 100,000
 deterministic fuzz frames.
 
+The packet-level reliability suite sends 520-byte transfers through 30%
+independent data and feedback loss and requires at least 95% completion within
+the eight-round bound. Additional cases cover cumulative bitmap selection,
+lost COMPLETE controls, duplicate and reordered fragments, delayed feedback,
+an incomplete receiver restart, transfer-counter wrap, exact BitChat length
+validation, and profile-derived deadlines for one through five fragments at
+SF7 through SF12.
+
 The legacy-v2 simulator cases intentionally assert the original protocol
 failures: fixed reassembly expiry under retries, partial frame enqueue,
 acceptance of an ACK from the wrong source, and broadcast ACK implosion. The
@@ -64,8 +72,8 @@ The production default keeps `CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE` disabled.
 For a controlled test, enable it on exactly one Heltec V3 build. That node
 waits until a signed direct announcement establishes an authenticated v3
 neighbor, then transmits one addressed synthetic packet at each of 1, 2, 3, 4,
-and 5 fragments, spaced 12 seconds apart. Keep the receiving node on the
-normal build.
+and 5 fragments. It retries fixture admission every three seconds and advances
+only after a probe is accepted. Keep the receiving node on the normal build.
 
 Capture both serial streams concurrently:
 
@@ -75,11 +83,12 @@ python tools/lora_hardware_smoke.py PORT_A PORT_B --seconds 90 --reset --quiet \
 ```
 
 The capture summarizes TX and completed RX counts by fragment count, addressed
-diagnostic events, authenticated-neighbor learning, exact v3 ACK traffic, and
-parser rejection counters. It also retains per-frame RSSI/SNR, the active
-profile, watchdog/recovery events, and periodic radio diagnostics. Raw serial
-output and JSON evidence may contain local device details, so keep it outside
-the repository.
+diagnostic events, authenticated-neighbor learning, bitmap/COMPLETE/ABORT
+controls, completed sender transfers, duplicate suppression, and parser
+rejection counters. It also retains per-frame RSSI/SNR, the active profile,
+watchdog/recovery events, and periodic radio diagnostics. Raw serial output and
+JSON evidence may contain local device details, so keep it outside the
+repository.
 
 Repeat with `CONFIG_BITLE_LORA_DEFAULT_SF` set to 10, 11, and 12 on both
 boards. At each SF, verify that the receiver records 136-byte frames and both
@@ -99,6 +108,9 @@ Runtime firmware emits a one-minute diagnostic summary containing:
 - TX attempts/timeouts, retries, ACK RX/TX/misses, and retry exhaustion;
 - current/high-water queue depth and queue-full events;
 - expired reassemblies and completed packets;
+- cumulative bitmap and COMPLETE controls, duplicate fragments/transfers,
+  explicit transfer aborts, invalid reassemblies, and resource-pressure
+  rejects;
 - rejected persisted configurations;
 - low-level command/BUSY errors, radio recoveries/failures, and independent TX
   watchdog recoveries.
@@ -108,3 +120,8 @@ with a 16-symbol preamble. Full 136-byte frames were received at every SF; all
 three runs reported zero SX1262 timeouts, command errors, and BUSY timeouts.
 Each injected run produced exactly one watchdog recovery with no recovery
 failure, then continued exchanging frames.
+
+Milestone 4's SF10 packet-reliability gate admitted and sender-confirmed all
+five addressed probes. The receiver emitted matching COMPLETE masks for
+one through five fragments with no abort, invalid-reassembly, resource,
+radio-command, BUSY-timeout, watchdog-recovery, or duplicate-delivery event.

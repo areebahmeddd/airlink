@@ -53,7 +53,8 @@ static bool v3_semantics_valid(const lora_trunk_frame_t *frame)
         (frame->flags & ~V3_FLAG_MASK) != 0 ||
         all_zero(frame->source, sizeof(frame->source)) ||
         all_zero(frame->transfer_id, sizeof(frame->transfer_id)) ||
-        !fragment_valid(frame->fragment_index, frame->fragment_total) ||
+        frame->fragment_total == 0 ||
+        frame->fragment_total > LORA_TRUNK_MAX_FRAGMENTS ||
         frame->payload_len > LORA_TRUNK_V3_MAX_PAYLOAD ||
         frame->hop_count > frame->hop_limit) {
         return false;
@@ -69,15 +70,36 @@ static bool v3_semantics_valid(const lora_trunk_frame_t *frame)
         if (frame->payload_len == 0 || !frame->payload) {
             return false;
         }
+        if (!fragment_valid(
+                frame->fragment_index, frame->fragment_total)) {
+            return false;
+        }
         if (broadcast != destination_zero || (broadcast && ack_requested)) {
             return false;
         }
         return true;
     }
-    if (frame->kind == LORA_TRUNK_KIND_FRAGMENT_ACK) {
-        return frame->flags == 0 && frame->payload_len == 0 &&
-               !frame->payload && !destination_zero &&
-               frame->hop_limit == 0 && frame->hop_count == 0;
+    bool control_base =
+        frame->flags == 0 && frame->payload_len == 0 &&
+        !frame->payload && !destination_zero &&
+        frame->hop_limit == 0 && frame->hop_count == 0;
+    if (!control_base) {
+        return false;
+    }
+    uint8_t wanted =
+        (uint8_t)((1u << frame->fragment_total) - 1u);
+    if (frame->kind == LORA_TRUNK_KIND_BITMAP_ACK) {
+        return frame->fragment_index != 0 &&
+               (frame->fragment_index & ~wanted) == 0;
+    }
+    if (frame->kind == LORA_TRUNK_KIND_COMPLETE) {
+        return frame->fragment_index == wanted;
+    }
+    if (frame->kind == LORA_TRUNK_KIND_ABORT) {
+        return frame->fragment_index >=
+                   LORA_TRUNK_ABORT_RETRY_EXHAUSTED &&
+               frame->fragment_index <=
+                   LORA_TRUNK_ABORT_RADIO_RESET;
     }
     return false;
 }
@@ -102,7 +124,7 @@ static lora_trunk_parse_result_t parse_v2(
     }
 
     out->version = LORA_TRUNK_V2_VERSION;
-    out->kind = is_ack ? LORA_TRUNK_KIND_FRAGMENT_ACK
+    out->kind = is_ack ? LORA_TRUNK_KIND_BITMAP_ACK
                        : LORA_TRUNK_KIND_DATA;
     out->flags = (data[3] & V2_FLAG_ACK_REQUESTED) != 0
                      ? LORA_TRUNK_V3_FLAG_ACK_REQUESTED
@@ -209,23 +231,25 @@ bool lora_trunk_v3_encode(
     return true;
 }
 
-bool lora_trunk_v3_ack_matches(
-    const lora_trunk_frame_t *data, const lora_trunk_frame_t *ack)
+bool lora_trunk_v3_control_matches(
+    const lora_trunk_frame_t *data,
+    const lora_trunk_frame_t *control)
 {
-    return data && ack &&
+    return data && control &&
            data->version == LORA_TRUNK_V3_VERSION &&
-           ack->version == LORA_TRUNK_V3_VERSION &&
+           control->version == LORA_TRUNK_V3_VERSION &&
            data->kind == LORA_TRUNK_KIND_DATA &&
-           ack->kind == LORA_TRUNK_KIND_FRAGMENT_ACK &&
+           (control->kind == LORA_TRUNK_KIND_BITMAP_ACK ||
+            control->kind == LORA_TRUNK_KIND_COMPLETE ||
+            control->kind == LORA_TRUNK_KIND_ABORT) &&
            (data->flags & LORA_TRUNK_V3_FLAG_ACK_REQUESTED) != 0 &&
-           memcmp(ack->source, data->destination,
+           memcmp(control->source, data->destination,
                   LORA_TRUNK_V3_NODE_ID_LEN) == 0 &&
-           memcmp(ack->destination, data->source,
+           memcmp(control->destination, data->source,
                   LORA_TRUNK_V3_NODE_ID_LEN) == 0 &&
-           memcmp(ack->transfer_id, data->transfer_id,
+           memcmp(control->transfer_id, data->transfer_id,
                   LORA_TRUNK_V3_TRANSFER_ID_LEN) == 0 &&
-           ack->fragment_index == data->fragment_index &&
-           ack->fragment_total == data->fragment_total;
+           control->fragment_total == data->fragment_total;
 }
 
 void lora_trunk_make_transfer_id(
