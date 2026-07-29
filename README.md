@@ -36,14 +36,14 @@ A single node runs a genuinely simultaneous **dual-role BLE stack** on NimBLE. I
 
 On ESP32-S3 nodes with a Wio-SX1262 module, Bitle runs a second radio: a 915 MHz LoRa **trunk** that carries traffic between nodes over kilometer-scale hops. BLE stays the access layer phones connect to; LoRa is backhaul only — phones have no LoRa radio and never see it. A message travels `phone → BLE → node → LoRa → node → BLE → phone`, like a cell tower's short access hop plus a long backhaul.
 
-- **One firmware, radio auto-detected.** `bitle_lora_init()` probes for the SX1262 at boot (scratch-register check). Found → the trunk comes up; absent (every C3, a bare S3) → the node runs BLE-only. Pin map and TCXO/RF-switch config match the Seeed Wio-SX1262 on the XIAO ESP32-S3.
+- **One firmware, radio auto-detected.** `bitle_lora_init()` probes for the SX1262 at boot (scratch-register check). Found → the trunk comes up; absent (every C3, a bare S3) → the node runs BLE-only. Board wiring (pin map, Vext power gate) is selected at build time via Kconfig: Seeed XIAO ESP32-S3 + Wio-SX1262 (default) and Heltec WiFi LoRa 32 V3 / Wireless Stick Lite V3 are supported — see [docs/LoRa-boards.md](docs/LoRa-boards.md).
 - **Trunk framing + reassembly.** Encoded BitChat packets are fragmented over ≤255-byte LoRa frames under a 16-byte trunk header (`0xB7 0x1E` magic, version, ftype, src/dst tag, seq, frag idx/total). Foreign LoRa traffic fails the magic check and is dropped. The receiver reassembles by `(src, seq)` and injects the packet into the same mesh core the BLE path uses.
 - **Per-frame ARQ.** Every non-announce frame is acknowledged and retransmitted up to three times; acks jump the queue and go out-of-band so a bidirectional exchange can't deadlock. Announces are ack-free periodic discovery beacons.
 - **Padding strip.** Phones pad handshakes/DMs to 256 bytes for BLE traffic-analysis resistance — pure airtime waste over the trunk. Because the BitChat packet is self-describing and padding trails the signature, the trunk trims to the true length before fragmenting (never touching signed/encrypted bytes). A 256-byte handshake message becomes one LoRa frame instead of three, which is what keeps a Noise first-contact handshake inside BitChat's timeout at high spreading factors.
 - **Admission + airtime governor.** The trunk carries relayed mesh traffic and the node's own discovery beacon; the node's own session-init and gossip `requestSync` are suppressed for broadcast links (a LoRa neighbor is a relay peer, not a chat/sync endpoint). Announces are throttled per origin (1 / 30 s) and pass a token-bucket airtime governor (default 25 % duty); message traffic is never throttled but still debits, so a busy DM session naturally quiets the beacons rather than the reverse. OTA image chunks stay off the trunk unless explicitly enabled (NVS `lora/ota_trunk`).
 - **Spreading factor and range.** Default **SF10 / BW125 / +22 dBm** — field-validated to complete an interactive DM (Noise handshake, auto-reply, receipts) through heavy non-line-of-sight (~700 ft / 30–40 walls). SF10 reaches ~2–3 km NLOS / ~8 km LOS; higher SF extends range at the cost of airtime (and handshake latency), lower SF is faster/shorter. Configurable via NVS `lora/sf`, `lora/freq`, `lora/duty_pct`, `lora/enabled`.
 
-Radio: **Semtech SX1262** (Seeed Wio-SX1262 + XIAO ESP32-S3), +22 dBm, 902–928 MHz, 125 kHz bandwidth, 2 dBi SMA antenna.
+Radio: **Semtech SX1262** (Seeed Wio-SX1262 + XIAO ESP32-S3, or Heltec V3 boards), +22 dBm, 902–928 MHz, 125 kHz bandwidth, 2 dBi SMA antenna.
 
 ## Boot sequence
 
@@ -104,6 +104,7 @@ Because OTA relies on this dual-slot layout, **nodes must be wire-flashed with t
 
 - **Bitle node (reference)** — Seeed Studio XIAO ESP32C3 with a 2.4 GHz antenna, solar charger, battery, and panel; the full parts list is at [bitle.org](https://bitle.org).
 - **Bitle-LR node (LoRa platform)** — the [Seeed Studio XIAO ESP32S3 & Wio-SX1262 kit](https://www.seeedstudio.com/Wio-SX1262-with-XIAO-ESP32S3-p-5982.html), also sold [with a 3D case, SMA antenna, and cable](https://www.seeedstudio.com/XIAO-ESP32S3-for-Meshtastic-LoRa-with-3D-Printed-Enclosure-p-6314.html). It ships pre-flashed with Meshtastic — run `idf.py erase-flash` before flashing Bitle. It runs the standard firmware as a full BLE relay node **and** brings up the SX1262 LoRa trunk between nodes (see [LoRa backhaul](#lora-backhaul)). Power parts (charger, battery, panel) are shared with the reference build.
+- **Bitle-LR node (Heltec V3)** — Heltec WiFi LoRa 32 V3 or Wireless Stick Lite V3 (ESP32-S3 + SX1262; both models share the same radio wiring). Select `CONFIG_BITLE_LORA_BOARD_HELTEC_V3=y` before building — the Vext peripheral rail is powered automatically; details in [docs/LoRa-boards.md](docs/LoRa-boards.md).
 
 ## Building & flashing
 
@@ -126,7 +127,7 @@ idf.py build
 idf.py -p /dev/cu.usbmodem101 flash monitor
 ```
 
-Adjust the serial port (`-p`) for your setup. `sdkconfig` is generated from `sdkconfig.defaults` on the first build.
+Adjust the serial port (`-p`) for your setup. `sdkconfig` is generated from `sdkconfig.defaults` on the first build; for `esp32s3`, `sdkconfig.defaults.esp32s3` layers on top (8 MB flash). On `esp32s3` the LoRa board wiring defaults to the Seeed XIAO + Wio-SX1262 — for Heltec V3 boards, select it via `idf.py menuconfig` → **Bitle hardware** → **SX1262 board wiring** before the first build (see [docs/LoRa-boards.md](docs/LoRa-boards.md)).
 
 ## Firmware updates & owner key
 
