@@ -64,7 +64,7 @@ The implementation is complete only when all of the following are true:
 | 2. Atomic packet scheduling and backpressure | Complete | `fe9e95e` | Concurrent saturation, both firmware targets, and two-board SF10 smoke passed |
 | 3. Addressed trunk protocol and migration | Complete | `3ee5843` | v2/v3 host protocol suite, both firmware targets, and addressed two-board v3 smoke passed |
 | 4. Packet-level reliability and reassembly | Complete | `33cfde3` | 99.35% sender completion at 30% data/feedback loss; five-of-five two-board transfer gate |
-| 5. Discovery and shared-channel behavior | Complete | Pending checkpoint | 100% simulated discovery; three-repeat two-board beacon gate passed |
+| 5. Discovery and shared-channel behavior | Complete | `873eddf` | 100% simulated discovery; three-repeat two-board beacon gate passed |
 | 6. LoRa multi-hop forwarding | Pending | — | — |
 | 7. Link adaptation and PHY hardening | Pending | — | — |
 | 8. End-to-end validation and rollout | Pending | — | — |
@@ -501,7 +501,7 @@ traffic from repeatedly colliding.
     radio timeouts, radio-command errors, BUSY timeouts, recovery failures,
     and software-watchdog recoveries; channel-backoff and airtime-budget
     counters were active.
-- Commit: Pending checkpoint
+- Commit: `873eddf`
 - Suggested commit subject: `feat(lora): harden discovery and channel access`
 
 ## Milestone 6: LoRa multi-hop forwarding
