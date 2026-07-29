@@ -70,10 +70,12 @@ the profile when the frequency is unambiguous.
 
 The production default keeps `CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE` disabled.
 For a controlled test, enable it on exactly one Heltec V3 build. That node
-waits until a signed direct announcement establishes an authenticated v3
-neighbor, then transmits one addressed synthetic packet at each of 1, 2, 3, 4,
-and 5 fragments. It retries fixture admission every three seconds and advances
-only after a probe is accepted. Keep the receiving node on the normal build.
+first transmits three spaced unaddressed public probes with normal application
+TTL to exercise same-medium forwarding. After a signed direct announcement
+establishes an authenticated v3 neighbor, it transmits one addressed synthetic
+packet at each of 1, 2, 3, 4, and 5 fragments. It retries fixture admission
+every three seconds and advances only after a probe is accepted. Keep every
+receiving node on the normal build.
 
 Capture both serial streams concurrently:
 
@@ -81,6 +83,13 @@ Capture both serial streams concurrently:
 python tools/lora_hardware_smoke.py PORT_A PORT_B --seconds 90 --reset --quiet \
   --json-out /tmp/bitle-lora-smoke.json
 ```
+
+The capture tool accepts a third or later port for topology tests. In a
+three-board same-room test, expect one receiver to transmit the forwarding
+probe at `hops=1/3`; another relay may cancel its queued copy after overhearing
+that transmission. A same-room triangle does not prove the physical
+endpoint-isolated line gate, so retain the deterministic 20%-loss line test or
+separate/attenuate the endpoints until they cannot receive each other.
 
 The capture summarizes TX and completed RX counts by fragment count, addressed
 diagnostic events, authenticated-neighbor learning, bitmap/COMPLETE/ABORT

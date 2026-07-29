@@ -1,5 +1,6 @@
 #include "lora_trunk_protocol.h"
 #include "lora_channel_policy.h"
+#include "lora_forwarding.h"
 
 #include <string.h>
 
@@ -75,7 +76,8 @@ static bool v3_semantics_valid(const lora_trunk_frame_t *frame)
 
     if (frame->kind == LORA_TRUNK_KIND_DATA) {
         if (frame->fragment_total == 0 ||
-            frame->fragment_total > LORA_TRUNK_MAX_FRAGMENTS) {
+            frame->fragment_total > LORA_TRUNK_MAX_FRAGMENTS ||
+            frame->hop_limit > LORA_FORWARD_MAX_HOP_LIMIT) {
             return false;
         }
         if (frame->payload_len == 0 || !frame->payload) {
@@ -408,7 +410,7 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
     const uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN],
     const uint8_t reachable_peer[LORA_TRUNK_V3_NODE_ID_LEN],
     const uint8_t signing_key[LORA_TRUNK_SIGNING_KEY_LEN],
-    uint16_t capabilities, uint64_t now_ms)
+    bool direct_identity, uint16_t capabilities, uint64_t now_ms)
 {
     if (!table || !node_id || !reachable_peer || !signing_key ||
         all_zero(node_id, LORA_TRUNK_V3_NODE_ID_LEN) ||
@@ -437,13 +439,16 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
         bool same_node =
             memcmp(entry->node_id, node_id,
                    LORA_TRUNK_V3_NODE_ID_LEN) == 0;
-        if (same_node && entry->identity_authenticated &&
+        if (direct_identity && same_node &&
+            entry->identity_authenticated &&
+            entry->direct_identity &&
             memcmp(entry->signing_key, signing_key,
                    LORA_TRUNK_SIGNING_KEY_LEN) != 0) {
             entry->quarantined = true;
             collision = true;
         }
-        if (same_node && !entry->identity_authenticated) {
+        if (direct_identity && same_node &&
+            !entry->identity_authenticated) {
             unauthenticated_node = entry;
         }
         if (entry->identity_authenticated &&
@@ -462,6 +467,7 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
             return LORA_TRUNK_NEIGHBOR_COLLISION;
         }
         memcpy(same_route->node_id, node_id, LORA_TRUNK_V3_NODE_ID_LEN);
+        same_route->direct_identity = direct_identity;
         same_route->capabilities = capabilities;
         same_route->last_seen_ms = now_ms;
         return LORA_TRUNK_NEIGHBOR_REFRESHED;
@@ -483,6 +489,7 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
     }
     entry->in_use = true;
     entry->identity_authenticated = true;
+    entry->direct_identity = direct_identity;
     memcpy(entry->node_id, node_id, LORA_TRUNK_V3_NODE_ID_LEN);
     memcpy(entry->reachable_peer, reachable_peer,
            LORA_TRUNK_V3_NODE_ID_LEN);
@@ -525,6 +532,27 @@ bool lora_trunk_neighbor_route(
         *out_capabilities = freshest->capabilities;
     }
     return true;
+}
+
+size_t lora_trunk_neighbor_forget_next_hop(
+    lora_trunk_neighbor_table_t *table,
+    const uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN])
+{
+    if (!table || !node_id) {
+        return 0;
+    }
+    size_t removed = 0;
+    for (size_t index = 0;
+         index < LORA_TRUNK_NEIGHBOR_CAPACITY; ++index) {
+        lora_trunk_neighbor_t *entry = &table->entries[index];
+        if (entry->in_use && entry->identity_authenticated &&
+            memcmp(entry->node_id, node_id,
+                   LORA_TRUNK_V3_NODE_ID_LEN) == 0) {
+            memset(entry, 0, sizeof(*entry));
+            removed++;
+        }
+    }
+    return removed;
 }
 
 size_t lora_trunk_neighbor_count(const lora_trunk_neighbor_table_t *table)

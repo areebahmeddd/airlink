@@ -10,6 +10,7 @@ milestones.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import heapq
 import math
 import random
 from typing import Iterable
@@ -431,6 +432,293 @@ class DiscoveryChannelModel:
         )
 
 
+@dataclass(frozen=True)
+class MeshHop:
+    loss: float = 0.0
+    snr_db: int = 0
+
+
+@dataclass(frozen=True)
+class MeshDeliveryResult:
+    delivered: bool
+    application_deliveries: int
+    reached_nodes: frozenset[str]
+    transmissions: int
+    duplicate_receptions: int
+    suppressed_forwards: int
+    hop_limit_drops: int
+    route_failures: int
+    processed_events: int
+
+
+class MultiHopMeshModel:
+    """Bounded flood/directed-forwarding model for trunk v3.
+
+    Each receiving node deduplicates the stable application transfer before
+    forwarding. Directed traffic uses a fresh reverse-path route when present,
+    retries each selected hop, and falls back to bounded flooding if the next
+    hop is unavailable. The application keeps an independent dedup set.
+    """
+
+    def __init__(
+        self,
+        nodes: Iterable[str],
+        links: dict[tuple[str, str], MeshHop],
+        *,
+        attempts_per_hop: int = 4,
+        hop_limit: int = 3,
+        route_ttl_ms: int = 180_000,
+        cache_retention_ms: int = 300_000,
+        cache_capacity: int = 32,
+        frame_airtime_ms: int = 1_000,
+        seed: int = 1,
+    ):
+        self.nodes = frozenset(nodes)
+        if len(self.nodes) < 2:
+            raise ValueError("mesh needs at least two nodes")
+        if attempts_per_hop <= 0 or not 1 <= hop_limit <= 4:
+            raise ValueError("invalid forwarding bounds")
+        if (
+            route_ttl_ms <= 0
+            or cache_retention_ms <= 0
+            or cache_capacity <= 0
+            or frame_airtime_ms <= 0
+        ):
+            raise ValueError("invalid route, cache, or airtime bound")
+        for (source, destination), hop in links.items():
+            if source not in self.nodes or destination not in self.nodes:
+                raise ValueError("link endpoint is not part of the mesh")
+            if source == destination or not 0.0 <= hop.loss <= 1.0:
+                raise ValueError("invalid directed mesh link")
+        self.links = dict(links)
+        self.attempts_per_hop = attempts_per_hop
+        self.hop_limit = hop_limit
+        self.route_ttl_ms = route_ttl_ms
+        self.cache_retention_ms = cache_retention_ms
+        self.cache_capacity = cache_capacity
+        self.frame_airtime_ms = frame_airtime_ms
+        self.random = random.Random(seed)
+        self.now_ms = 0
+        self.disabled_links: set[tuple[str, str]] = set()
+        self.routes: dict[str, dict[str, tuple[str, int]]] = {
+            node: {} for node in self.nodes
+        }
+        self.network_seen: dict[str, dict[bytes, int]] = {
+            node: {} for node in self.nodes
+        }
+        self.application_seen: dict[str, set[bytes]] = {
+            node: set() for node in self.nodes
+        }
+
+    def learn_route(
+        self, node: str, destination: str, next_hop: str
+    ) -> None:
+        if (
+            node not in self.nodes
+            or destination not in self.nodes
+            or next_hop not in self.nodes
+        ):
+            raise ValueError("route endpoint is not part of the mesh")
+        self.routes[node][destination] = (
+            next_hop, self.now_ms + self.route_ttl_ms
+        )
+
+    def disable_link(self, source: str, destination: str) -> None:
+        self.disabled_links.add((source, destination))
+
+    def reboot_node(self, node: str) -> None:
+        if node not in self.nodes:
+            raise ValueError("node is not part of the mesh")
+        self.routes[node].clear()
+        self.network_seen[node].clear()
+        self.application_seen[node].clear()
+
+    def _observe(self, node: str, transfer_id: bytes) -> bool:
+        cache = self.network_seen[node]
+        expired = [
+            key for key, expiry in cache.items()
+            if self.now_ms >= expiry
+        ]
+        for key in expired:
+            del cache[key]
+        if transfer_id in cache:
+            return False
+        if len(cache) >= self.cache_capacity:
+            oldest = min(cache, key=cache.get)
+            del cache[oldest]
+        cache[transfer_id] = self.now_ms + self.cache_retention_ms
+        return True
+
+    def _fresh_next_hop(
+        self, node: str, destination: str
+    ) -> str | None:
+        route = self.routes[node].get(destination)
+        if not route:
+            return None
+        next_hop, expiry = route
+        if self.now_ms >= expiry:
+            del self.routes[node][destination]
+            return None
+        return next_hop
+
+    def _outgoing(self, node: str) -> list[str]:
+        return sorted(
+            destination
+            for source, destination in self.links
+            if source == node
+        )
+
+    def _transmit(self, source: str, destination: str) -> tuple[bool, int]:
+        hop = self.links.get((source, destination))
+        if not hop or (source, destination) in self.disabled_links:
+            return False, 0
+        attempts = 0
+        for _ in range(self.attempts_per_hop):
+            attempts += 1
+            if self.random.random() >= hop.loss:
+                return True, attempts
+        return False, attempts
+
+    def send(
+        self,
+        source: str,
+        transfer_id: bytes,
+        destination: str | None = None,
+        *,
+        hop_limit: int | None = None,
+    ) -> MeshDeliveryResult:
+        if source not in self.nodes:
+            raise ValueError("source is not part of the mesh")
+        if destination is not None and destination not in self.nodes:
+            raise ValueError("destination is not part of the mesh")
+        if not transfer_id:
+            raise ValueError("transfer identity cannot be empty")
+        effective_limit = self.hop_limit if hop_limit is None else hop_limit
+        if not 1 <= effective_limit <= 4:
+            raise ValueError("invalid hop limit")
+
+        self.now_ms += 100
+        events: list[
+            tuple[int, int, str, str | None, int, int]
+        ] = []
+        sequence = 0
+        heapq.heappush(events, (self.now_ms, sequence, source, None, 0, 12))
+        reached: set[str] = set()
+        transmissions = 0
+        duplicate_receptions = 0
+        suppressed_forwards = 0
+        hop_limit_drops = 0
+        route_failures = 0
+        application_deliveries = 0
+        processed_events = 0
+
+        while events:
+            ready_at, _, node, previous, hops, _ = heapq.heappop(
+                events
+            )
+            self.now_ms = max(self.now_ms, ready_at)
+            processed_events += 1
+            if not self._observe(node, transfer_id):
+                duplicate_receptions += 1
+                suppressed_forwards += 1
+                continue
+            reached.add(node)
+            if previous is not None:
+                self.routes[node][source] = (
+                    previous, self.now_ms + self.route_ttl_ms
+                )
+
+            should_deliver = (
+                node != source
+                and (destination is None or node == destination)
+            )
+            if should_deliver and transfer_id not in self.application_seen[node]:
+                self.application_seen[node].add(transfer_id)
+                application_deliveries += 1
+            if destination is not None and node == destination:
+                continue
+            if hops >= effective_limit:
+                hop_limit_drops += 1
+                continue
+
+            next_hop = (
+                self._fresh_next_hop(node, destination)
+                if destination is not None
+                else None
+            )
+            candidates = [next_hop] if next_hop else self._outgoing(node)
+            failed_route = None
+            for candidate in candidates:
+                success, attempts = self._transmit(node, candidate)
+                transmissions += attempts
+                if not success:
+                    if candidate == next_hop:
+                        route_failures += 1
+                        failed_route = candidate
+                        del self.routes[node][destination]
+                    continue
+                sequence += 1
+                snr = self.links[(node, candidate)].snr_db
+                delay = lora_forward_delay_ms(
+                    self.frame_airtime_ms, snr, self.random.randrange(1 << 32)
+                )
+                heapq.heappush(
+                    events,
+                    (
+                        self.now_ms + delay,
+                        sequence,
+                        candidate,
+                        node,
+                        hops + 1,
+                        snr,
+                    ),
+                )
+
+            if failed_route is not None:
+                for candidate in self._outgoing(node):
+                    if candidate == failed_route:
+                        continue
+                    success, attempts = self._transmit(node, candidate)
+                    transmissions += attempts
+                    if not success:
+                        continue
+                    sequence += 1
+                    snr = self.links[(node, candidate)].snr_db
+                    delay = lora_forward_delay_ms(
+                        self.frame_airtime_ms,
+                        snr,
+                        self.random.randrange(1 << 32),
+                    )
+                    heapq.heappush(
+                        events,
+                        (
+                            self.now_ms + delay,
+                            sequence,
+                            candidate,
+                            node,
+                            hops + 1,
+                            snr,
+                        ),
+                    )
+
+        delivered = (
+            destination in reached
+            if destination is not None
+            else reached == set(self.nodes)
+        )
+        return MeshDeliveryResult(
+            delivered=delivered,
+            application_deliveries=application_deliveries,
+            reached_nodes=frozenset(reached),
+            transmissions=transmissions,
+            duplicate_receptions=duplicate_receptions,
+            suppressed_forwards=suppressed_forwards,
+            hop_limit_drops=hop_limit_drops,
+            route_failures=route_failures,
+            processed_events=processed_events,
+        )
+
+
 def contention_window_ms(
     frame_airtime_ms: int,
     busy_attempt: int = 0,
@@ -448,6 +736,23 @@ def contention_window_ms(
         spread += frame_airtime_ms // 2
     minimum = min(minimum, 15_000)
     return minimum, min(minimum + spread, 20_000)
+
+
+def lora_forward_delay_ms(
+    frame_airtime_ms: int, snr_db: int, entropy: int
+) -> int:
+    if frame_airtime_ms <= 0 or entropy < 0:
+        raise ValueError("invalid forwarding delay parameters")
+    quality = min(max(snr_db, -20), 12)
+    base = max(frame_airtime_ms // 2, 100)
+    quality_penalty = (
+        (12 - quality) * frame_airtime_ms // 16
+    )
+    spread = max(frame_airtime_ms, 200)
+    return min(
+        base + quality_penalty + entropy % (spread + 1),
+        20_000,
+    )
 
 
 def hidden_sender_delays(

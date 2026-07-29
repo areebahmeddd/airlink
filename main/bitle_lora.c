@@ -17,6 +17,7 @@
 #include "bitle_stats.h"
 #include "lora_airtime.h"
 #include "lora_channel_policy.h"
+#include "lora_forwarding.h"
 #include "lora_packet_reliability.h"
 #include "lora_region.h"
 #include "lora_trunk_protocol.h"
@@ -132,10 +133,16 @@ typedef struct {
     bool valid;
     bool ack_requested;
     bool announcement;
+    bool forwarded;
     bool relayed_broadcast;
+    bool suppressed;
+    uint8_t hop_limit;
+    uint8_t hop_count;
     uint8_t announce_sender[8];
     uint8_t destination[LORA_TRUNK_V3_NODE_ID_LEN];
     uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN];
+    uint64_t forward_fingerprint;
+    uint64_t forward_not_before_ms;
 } tx_trunk_context_t;
 static tx_trunk_context_t s_tx_context[LORA_TX_PACKET_POOL_SIZE];
 
@@ -146,6 +153,16 @@ static bool s_expected_control_valid;
 static lora_trunk_frame_t s_expected_control_data;
 static lora_selective_tx_t s_selective_tx;
 static lora_trunk_neighbor_table_t s_neighbors;
+static lora_forward_cache_t s_forward_cache;
+
+typedef struct {
+    bool active;
+    uint8_t hop_limit;
+    uint8_t hop_count;
+    int8_t snr;
+    uint64_t fingerprint;
+} relay_ingress_t;
+static relay_ingress_t s_relay_ingress;
 
 /* Modem params (for airtime), governor, and throttle state — shared
  * between relay callers and the beacon path, guarded by a spinlock. */
@@ -223,6 +240,30 @@ static void diag_sync_scheduler_locked(void)
         s_diag.packet_accepted[priority] = metrics.accepted[priority];
         s_diag.packet_deferred[priority] = metrics.deferred[priority];
     }
+}
+
+/* Caller holds s_gov_mux. Mark every not-yet-transmitted broadcast relay of
+ * this logical BitChat packet. The LoRa task releases queued or active entries
+ * before their next CAD/TX opportunity. */
+static uint32_t suppress_relay_fingerprint_locked(
+    uint64_t fingerprint)
+{
+    if (fingerprint == 0) {
+        return 0;
+    }
+    uint32_t suppressed = 0;
+    for (lora_tx_handle_t handle = 0;
+         handle < LORA_TX_PACKET_POOL_SIZE; ++handle) {
+        tx_trunk_context_t *context = &s_tx_context[handle];
+        if (context->valid && context->relayed_broadcast &&
+            !context->suppressed &&
+            context->forward_fingerprint == fingerprint) {
+            context->suppressed = true;
+            suppressed++;
+        }
+    }
+    s_diag.forward_suppressed += suppressed;
+    return suppressed;
 }
 
 /* Per-origin announce throttle. Admission marks one pending copy; only a
@@ -326,7 +367,8 @@ static bool beacon_budget_admit(uint16_t encoded_len)
     return admitted;
 }
 
-static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
+static bool trunk_admit_locked(
+    const uint8_t *data, uint16_t len, bool forwarded)
 {
     if (len < PKT_MIN_LEN) {
         return false;
@@ -371,7 +413,13 @@ static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
      * a timestamp, so a budget-deferred announce does not suppress this
      * origin's next transmittable announce. */
     if (governed) {
-        if (s_gov_credit_ms < (double)airtime) {
+        /* A relayed signed announce is the route-discovery mechanism, not a
+         * new local periodic advertisement. It may consume the remaining
+         * bounded burst credit so one route copy can cross a weak mesh, while
+         * the per-origin throttle and network dedup still prevent storms.
+         * The resulting negative credit delays later local announcements and
+         * beacons until the channel budget refills. */
+        if (!forwarded && s_gov_credit_ms < (double)airtime) {
             ESP_LOGD(TAG, "airtime budget low; deferring announce");
             return false;
         }
@@ -540,8 +588,9 @@ static void lora_link_cancel(uint16_t handle, uintptr_t token)
     taskEXIT_CRITICAL(&s_gov_mux);
 }
 
-static bitle_link_send_result_t lora_link_commit(
-    uint16_t handle, uintptr_t token, const uint8_t *data, uint16_t len)
+static bitle_link_send_result_t lora_link_commit_internal(
+    uint16_t handle, uintptr_t token, const uint8_t *data, uint16_t len,
+    bool same_medium_relay)
 {
     (void)handle;
     if (!data || len == 0 || len > BITCHAT_BLE_MAX_PACKET_SIZE ||
@@ -565,6 +614,10 @@ static bitle_link_send_result_t lora_link_commit(
     bool announcement =
         type == BITCHAT_MSG_ANNOUNCE ||
         type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE;
+    relay_ingress_t ingress = s_relay_ingress;
+    bool forwarded = same_medium_relay && ingress.active;
+    uint64_t forward_fingerprint =
+        lora_forward_fingerprint(data, len);
     bool committed = false;
 
     taskENTER_CRITICAL(&s_gov_mux);
@@ -577,7 +630,18 @@ static bitle_link_send_result_t lora_link_commit(
         taskEXIT_CRITICAL(&s_gov_mux);
         return BITLE_LINK_SEND_FAILED;
     }
-    if (!trunk_admit_locked(data, len)) {
+    if (same_medium_relay &&
+        (!forwarded ||
+         !lora_forward_hop_allowed(
+             ingress.hop_limit, ingress.hop_count))) {
+        s_diag.hop_limit_drops++;
+        s_diag.policy_drops++;
+        lora_tx_scheduler_cancel(&s_tx_scheduler, reserved);
+        diag_sync_scheduler_locked();
+        taskEXIT_CRITICAL(&s_gov_mux);
+        return BITLE_LINK_SEND_POLICY_DROPPED;
+    }
+    if (!trunk_admit_locked(data, len, forwarded)) {
         s_diag.policy_drops++;
         lora_tx_scheduler_cancel(&s_tx_scheduler, reserved);
         diag_sync_scheduler_locked();
@@ -617,11 +681,32 @@ static bitle_link_send_result_t lora_link_commit(
         context->valid = true;
         context->ack_requested = ack_requested;
         context->announcement = announcement;
+        context->forwarded = forwarded;
         context->relayed_broadcast =
             !ack_requested &&
-            memcmp(
-                data + PKT_SENDER_OFF, s_node_id,
-                sizeof(s_node_id)) != 0;
+            (forwarded ||
+             memcmp(
+                 data + PKT_SENDER_OFF, s_node_id,
+                 sizeof(s_node_id)) != 0);
+        context->hop_limit =
+            forwarded ? ingress.hop_limit
+                      : LORA_FORWARD_DEFAULT_HOP_LIMIT;
+        context->hop_count =
+            forwarded ? (uint8_t)(ingress.hop_count + 1u) : 0;
+        context->forward_fingerprint =
+            context->relayed_broadcast
+                ? forward_fingerprint
+                : 0;
+        if (forwarded && context->relayed_broadcast) {
+            uint16_t first_chunk =
+                len < TRUNK_CHUNK_TX ? len : TRUNK_CHUNK_TX;
+            context->forward_not_before_ms =
+                esp_timer_get_time() / 1000ULL +
+                lora_forward_delay_ms(
+                    trunk_airtime_ms(
+                        LORA_TRUNK_V3_HEADER_LEN + first_chunk),
+                    ingress.snr, esp_random());
+        }
         if (announcement) {
             memcpy(
                 context->announce_sender,
@@ -632,6 +717,12 @@ static bitle_link_send_result_t lora_link_commit(
         }
         memcpy(context->destination, destination, sizeof(destination));
         memcpy(context->transfer_id, transfer_id, sizeof(transfer_id));
+        if (!forwarded && forward_fingerprint != 0) {
+            (void)lora_forward_cache_observe(
+                &s_forward_cache, data + PKT_SENDER_OFF,
+                forward_fingerprint, 0, 12,
+                esp_timer_get_time() / 1000ULL);
+        }
         s_transfer_counter = transfer_counter;
     } else {
         memset(&s_tx_context[reserved], 0, sizeof(s_tx_context[reserved]));
@@ -647,14 +738,25 @@ static bitle_link_send_result_t lora_link_commit(
         (uint8_t)((len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
     ESP_LOGI(TAG,
              "trunk accepted type=0x%02X len=%u frags=%u priority=%u "
-             "addressed=%d transfer=%lu",
+             "addressed=%d transfer=%lu hops=%u/%u forwarded=%d",
              type, len, total, priority, ack_requested,
-             (unsigned long)transfer_counter);
+             (unsigned long)transfer_counter,
+             forwarded ? (unsigned)(ingress.hop_count + 1u) : 0u,
+             forwarded ? (unsigned)ingress.hop_limit
+                       : LORA_FORWARD_DEFAULT_HOP_LIMIT,
+             forwarded);
     bitle_stats_note_activity(BITLE_LANE_TRUNK, 1);
     if (s_task) {
         xTaskNotifyGive(s_task);
     }
     return BITLE_LINK_SEND_ACCEPTED;
+}
+
+static bitle_link_send_result_t lora_link_commit(
+    uint16_t handle, uintptr_t token, const uint8_t *data, uint16_t len)
+{
+    return lora_link_commit_internal(
+        handle, token, data, len, false);
 }
 
 /* Mesh -> trunk convenience path. Reservation happens before policy state or
@@ -672,6 +774,22 @@ static bitle_link_send_result_t lora_link_send(
         return result;
     }
     return lora_link_commit(handle, token, data, len);
+}
+
+static bitle_link_send_result_t lora_link_relay_send(
+    uint16_t handle, const uint8_t *data, uint16_t len)
+{
+    if (!data || len <= PKT_TYPE_OFF) {
+        return BITLE_LINK_SEND_FAILED;
+    }
+    uintptr_t token = 0;
+    bitle_link_send_result_t result =
+        lora_link_reserve(handle, data[PKT_TYPE_OFF], &token);
+    if (result != BITLE_LINK_SEND_ACCEPTED) {
+        return result;
+    }
+    return lora_link_commit_internal(
+        handle, token, data, len, true);
 }
 
 static bool tx_scheduler_dequeue(lora_tx_handle_t *out_handle)
@@ -692,10 +810,23 @@ static void tx_scheduler_release(
     }
     taskENTER_CRITICAL(&s_gov_mux);
     tx_trunk_context_t context = s_tx_context[handle];
+    uint64_t now = esp_timer_get_time() / 1000ULL;
     if (context.announcement) {
         announce_finish_locked(
-            context.announce_sender, transmitted,
-            esp_timer_get_time() / 1000ULL);
+            context.announce_sender, transmitted, now);
+    }
+    if (transmitted && context.forwarded) {
+        s_diag.forwarded_packets++;
+    } else if (!transmitted && context.ack_requested) {
+        size_t removed =
+            lora_trunk_neighbor_forget_next_hop(
+                &s_neighbors, context.destination);
+        if (removed > 0) {
+            s_diag.route_failures += (uint32_t)removed;
+            s_diag.neighbor_count =
+                (uint32_t)lora_trunk_neighbor_count(
+                    &s_neighbors);
+        }
     }
     memset(&s_tx_context[handle], 0, sizeof(s_tx_context[handle]));
     lora_tx_scheduler_release(&s_tx_scheduler, handle);
@@ -739,6 +870,8 @@ static bool build_tx_fragment(lora_tx_handle_t handle, uint8_t idx,
                      ? LORA_TRUNK_V3_FLAG_ACK_REQUESTED
                      : LORA_TRUNK_V3_FLAG_BROADCAST,
         .capabilities = LORA_TRUNK_V3_CAP_PROTOCOL,
+        .hop_limit = context->hop_limit,
+        .hop_count = context->hop_count,
         .fragment_index = idx,
         .fragment_total = total,
         .payload = packet->data + off,
@@ -936,15 +1069,16 @@ static void learn_authenticated_neighbor(
         return;
     }
     uint8_t signing_key[LORA_TRUNK_SIGNING_KEY_LEN];
-    if (memcmp(packet.sender_id, frame->source,
-               LORA_TRUNK_V3_NODE_ID_LEN) == 0 &&
-        noise_verify_announce_identity(&packet, signing_key)) {
+    if (noise_verify_announce_identity(&packet, signing_key)) {
+        bool direct_identity =
+            memcmp(packet.sender_id, frame->source,
+                   LORA_TRUNK_V3_NODE_ID_LEN) == 0;
         uint32_t neighbor_count = 0;
         taskENTER_CRITICAL(&s_gov_mux);
         lora_trunk_neighbor_result_t result =
             lora_trunk_neighbor_learn_authenticated(
                 &s_neighbors, frame->source, packet.sender_id, signing_key,
-                frame->capabilities, now_ms);
+                direct_identity, frame->capabilities, now_ms);
         if (result == LORA_TRUNK_NEIGHBOR_COLLISION) {
             s_diag.neighbor_collisions++;
         }
@@ -1213,12 +1347,52 @@ static void reassemble_data(
         queue_ack(frame);
     }
 
-    learn_authenticated_neighbor(frame, packet, packet_len, now);
+    uint64_t forward_fingerprint =
+        lora_forward_fingerprint(packet, packet_len);
+    lora_forward_observation_t observation;
+    uint32_t suppressed = 0;
+    taskENTER_CRITICAL(&s_gov_mux);
+    observation = lora_forward_cache_observe(
+        &s_forward_cache, packet + PKT_SENDER_OFF,
+        forward_fingerprint, frame->hop_count, snr, now);
+    if (observation != LORA_FORWARD_NEW) {
+        s_diag.forward_duplicates++;
+        suppressed = suppress_relay_fingerprint_locked(
+            forward_fingerprint);
+    }
+    taskEXIT_CRITICAL(&s_gov_mux);
+    if (observation == LORA_FORWARD_NEW ||
+        observation == LORA_FORWARD_BETTER_COPY) {
+        /* Only a first or objectively better signed path may replace a route.
+         * A later weaker duplicate still suppresses redundant forwarding but
+         * cannot steer the neighbor table. */
+        learn_authenticated_neighbor(
+            frame, packet, packet_len, now);
+    }
+    if (observation != LORA_FORWARD_NEW) {
+        ESP_LOGI(
+            TAG,
+            "trunk duplicate network packet suppressed=%lu better=%d",
+            (unsigned long)suppressed,
+            observation == LORA_FORWARD_BETTER_COPY);
+        return;
+    }
+
     diag_inc(&s_diag.completed_packets);
-    ESP_LOGI(TAG, "trunk v%u RX packet len=%u rssi=%d snr=%d frags=%u",
+    ESP_LOGI(TAG,
+             "trunk v%u RX packet len=%u rssi=%d snr=%d frags=%u "
+             "hops=%u/%u",
              frame->version, packet_len, rssi, snr,
-             frame->fragment_total);
+             frame->fragment_total, frame->hop_count,
+             frame->hop_limit);
+    s_relay_ingress.active =
+        frame->version == LORA_TRUNK_V3_VERSION;
+    s_relay_ingress.hop_limit = frame->hop_limit;
+    s_relay_ingress.hop_count = frame->hop_count;
+    s_relay_ingress.snr = snr;
+    s_relay_ingress.fingerprint = forward_fingerprint;
     bitle_mesh_inbound(BITLE_LORA_LINK_HANDLE, packet, packet_len);
+    memset(&s_relay_ingress, 0, sizeof(s_relay_ingress));
 }
 
 static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
@@ -1512,6 +1686,7 @@ static void lora_task(void *arg)
     unsigned ack_burst = 0;
     uint64_t tx_watchdog_deadline = 0;
     uint64_t backoff_deadline = 0;
+    uint64_t pending_forward_not_before_ms = 0;
     uint64_t ack_deadline = 0;
     uint64_t transfer_deadline = 0;
     lora_reliability_timing_t transfer_timing = {0};
@@ -1528,6 +1703,7 @@ static void lora_task(void *arg)
 #if CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE
     static const uint16_t smoke_lengths[] = {100, 180, 300, 420, 520};
     size_t smoke_index = 0;
+    uint8_t forwarding_smoke_count = 0;
     uint64_t next_smoke_ms = 12000ULL;
 #endif
 #if CONFIG_BITLE_LORA_DIAGNOSTIC_SUPPRESS_TX_DONE_ONCE
@@ -1553,7 +1729,47 @@ static void lora_task(void *arg)
         }
 
 #if CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE
-        if (smoke_index < sizeof(smoke_lengths) / sizeof(smoke_lengths[0]) &&
+        if (forwarding_smoke_count < 3 &&
+            now >= next_smoke_ms) {
+            static uint8_t forwarding_probe[100];
+            memset(
+                forwarding_probe, 0xA5,
+                sizeof(forwarding_probe));
+            forwarding_probe[0] = 1;
+            forwarding_probe[1] = BITCHAT_MSG_MESSAGE;
+            forwarding_probe[2] = BITLE_ORIGIN_TTL;
+            forwarding_probe[3] = forwarding_smoke_count;
+            forwarding_probe[11] = 0;
+            uint16_t payload_len =
+                sizeof(forwarding_probe) - PKT_MIN_LEN;
+            forwarding_probe[12] = payload_len >> 8;
+            forwarding_probe[13] = payload_len & 0xFF;
+            memcpy(
+                forwarding_probe + PKT_SENDER_OFF,
+                noise_get_local_peer_id(), 8);
+            bitle_link_send_result_t result =
+                lora_link_send(
+                    BITLE_LORA_LINK_HANDLE,
+                    forwarding_probe,
+                    sizeof(forwarding_probe));
+            if (result == BITLE_LINK_SEND_ACCEPTED) {
+                ESP_LOGI(
+                    TAG,
+                    "diagnostic forwarding smoke enqueue len=%u "
+                    "expected_frags=1 sequence=%u",
+                    (unsigned)sizeof(forwarding_probe),
+                    forwarding_smoke_count);
+                forwarding_smoke_count++;
+            } else {
+                ESP_LOGW(
+                    TAG,
+                    "diagnostic forwarding smoke deferred result=%u",
+                    result);
+            }
+            next_smoke_ms = now + 5000ULL;
+        } else if (
+            smoke_index <
+                sizeof(smoke_lengths) / sizeof(smoke_lengths[0]) &&
             now >= next_smoke_ms) {
             static uint8_t probe[BITCHAT_BLE_MAX_PACKET_SIZE];
             uint16_t probe_len = smoke_lengths[smoke_index];
@@ -1632,7 +1848,9 @@ static void lora_task(void *arg)
                      "unsupported=%lu ack_reject=%lu neighbors=%lu collision=%lu "
                      "bitmap=%lu final=%lu dup=%lu/%lu abort=%lu/%lu "
                      "invalid=%lu resource=%lu beacon=%lu/%lu stale=%lu "
-                     "budget=%lu backoff=%lu announce_tx=%lu",
+                     "budget=%lu backoff=%lu announce_tx=%lu "
+                     "forward=%lu suppress=%lu dup_net=%lu hop_drop=%lu "
+                     "route_fail=%lu",
                      (unsigned long)diag.raw_rx_frames,
                      (unsigned long)diag.crc_errors,
                      (unsigned long)diag.tx_attempts,
@@ -1682,7 +1900,12 @@ static void lora_task(void *arg)
                      (unsigned long)diag.beacon_stale,
                      (unsigned long)diag.beacon_budget_deferred,
                      (unsigned long)diag.channel_backoffs,
-                     (unsigned long)diag.announce_tx);
+                     (unsigned long)diag.announce_tx,
+                     (unsigned long)diag.forwarded_packets,
+                     (unsigned long)diag.forward_suppressed,
+                     (unsigned long)diag.forward_duplicates,
+                     (unsigned long)diag.hop_limit_drops,
+                     (unsigned long)diag.route_failures);
             next_diag_ms = now + 60000ULL;
         }
 
@@ -1944,6 +2167,16 @@ static void lora_task(void *arg)
             }
         }
 
+        if (have_pending && !pending_is_beacon &&
+            packet_handle != LORA_TX_HANDLE_INVALID &&
+            s_tx_context[packet_handle].suppressed &&
+            !awaiting_tx_done && !awaiting_cad) {
+            awaiting_backoff = false;
+            awaiting_ack = false;
+            drop_tx_packet(&packet_handle, &have_pending);
+            ESP_LOGI(TAG, "suppressed pending duplicate rebroadcast");
+        }
+
         /* Acks fly the moment the radio is free — no CAD, no queueing: the
          * peer is listening right after its TX and is waiting on us. */
         bool data_waiting = have_pending || tx_scheduler_has_queued();
@@ -2080,6 +2313,7 @@ static void lora_task(void *arg)
                     have_pending = true;
                     pending_is_beacon = true;
                     pending_relayed_broadcast = false;
+                    pending_forward_not_before_ms = 0;
                     s_expected_control_valid = false;
                 } else {
                     beacon_schedule.next_repeat_ms =
@@ -2092,8 +2326,16 @@ static void lora_task(void *arg)
                 tx_scheduler_dequeue(&packet_handle)) {
                 fragment_idx = 0;
                 pending_is_beacon = false;
+                if (s_tx_context[packet_handle].suppressed) {
+                    drop_tx_packet(
+                        &packet_handle, &have_pending);
+                    continue;
+                }
                 pending_relayed_broadcast =
                     s_tx_context[packet_handle].relayed_broadcast;
+                pending_forward_not_before_ms =
+                    s_tx_context[packet_handle]
+                        .forward_not_before_ms;
                 have_pending = build_tx_fragment(
                     packet_handle, fragment_idx, &pending,
                     &fragment_total);
@@ -2131,6 +2373,11 @@ static void lora_task(void *arg)
             if (schedule_contention_backoff(
                     &pending, 0, pending_relayed_broadcast,
                     &backoff_deadline)) {
+                if (pending_forward_not_before_ms >
+                    backoff_deadline) {
+                    backoff_deadline =
+                        pending_forward_not_before_ms;
+                }
                 awaiting_backoff = true;
             } else {
                 if (pending_is_beacon) {
@@ -2187,6 +2434,8 @@ void bitle_lora_shutdown(void)
     memset(s_rx_slots, 0, sizeof(s_rx_slots));
     memset(s_completed_slots, 0, sizeof(s_completed_slots));
     memset(&s_selective_tx, 0, sizeof(s_selective_tx));
+    lora_forward_cache_init(&s_forward_cache);
+    memset(&s_relay_ingress, 0, sizeof(s_relay_ingress));
     s_expected_control_valid = false;
     s_feedback_seen = false;
     s_ack_head = 0;
@@ -2319,6 +2568,8 @@ esp_err_t bitle_lora_init(void)
     memset(s_rx_slots, 0, sizeof(s_rx_slots));
     memset(s_completed_slots, 0, sizeof(s_completed_slots));
     lora_trunk_neighbor_table_init(&s_neighbors);
+    lora_forward_cache_init(&s_forward_cache);
+    memset(&s_relay_ingress, 0, sizeof(s_relay_ingress));
     s_expected_control_valid = false;
     s_feedback_seen = false;
     memset(&s_selective_tx, 0, sizeof(s_selective_tx));
@@ -2354,9 +2605,10 @@ esp_err_t bitle_lora_init(void)
     }
 
     s_active = true;
-    err = bitle_link_register_reservable(
+    err = bitle_link_register_reservable_relay(
         BITLE_LORA_LINK_HANDLE, BITLE_LINK_LORA, lora_link_send,
-        lora_link_reserve, lora_link_commit, lora_link_cancel);
+        lora_link_relay_send, lora_link_reserve, lora_link_commit,
+        lora_link_cancel);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "trunk link registration failed: %s",
                  esp_err_to_name(err));

@@ -11,6 +11,7 @@ idf_component_register(
         "bitle_lora.c"
         "lora_airtime.c"
         "lora_channel_policy.c"
+        "lora_forwarding.c"
         "lora_packet_reliability.c"
         "lora_region.c"
         "lora_trunk_protocol.c"

@@ -61,6 +61,8 @@ static size_t encode(
 static void test_v3_round_trip_and_malformed(void)
 {
     lora_trunk_frame_t data = make_data(SOURCE_A, SOURCE_B, false);
+    data.hop_limit = 3;
+    data.hop_count = 2;
     uint8_t wire[255];
     size_t len = encode(&data, wire);
     lora_trunk_frame_t parsed;
@@ -71,6 +73,8 @@ static void test_v3_round_trip_and_malformed(void)
     assert(memcmp(parsed.source, SOURCE_A, 8) == 0);
     assert(memcmp(parsed.destination, SOURCE_B, 8) == 0);
     assert(memcmp(parsed.transfer_id, data.transfer_id, 12) == 0);
+    assert(parsed.hop_limit == 3);
+    assert(parsed.hop_count == 2);
 
     for (size_t i = 0; i < LORA_TRUNK_V3_HEADER_LEN; ++i) {
         uint8_t saved = wire[i];
@@ -90,6 +94,12 @@ static void test_v3_round_trip_and_malformed(void)
     assert(!lora_trunk_v3_encode(&invalid, wire, sizeof(wire), &len));
     invalid = data;
     memset(invalid.transfer_id, 0, sizeof(invalid.transfer_id));
+    assert(!lora_trunk_v3_encode(&invalid, wire, sizeof(wire), &len));
+    invalid = data;
+    invalid.hop_limit = 5;
+    assert(!lora_trunk_v3_encode(&invalid, wire, sizeof(wire), &len));
+    invalid = data;
+    invalid.hop_count = 4;
     assert(!lora_trunk_v3_encode(&invalid, wire, sizeof(wire), &len));
 }
 
@@ -203,11 +213,15 @@ static void test_compact_beacon_and_identity_separation(void)
     uint8_t key[32] = {1};
     assert(lora_trunk_neighbor_learn_authenticated(
                &table, SOURCE_A, SOURCE_A, key,
-               LORA_TRUNK_V3_CAP_PROTOCOL, 1300) ==
+               true, LORA_TRUNK_V3_CAP_PROTOCOL, 1300) ==
            LORA_TRUNK_NEIGHBOR_LEARNED);
     assert(table.entries[0].identity_authenticated);
     assert(lora_trunk_neighbor_route(
         &table, SOURCE_A, 1400, 5000, route, NULL));
+    assert(lora_trunk_neighbor_forget_next_hop(
+               &table, SOURCE_A) == 1);
+    assert(!lora_trunk_neighbor_route(
+        &table, SOURCE_A, 1500, 5000, route, NULL));
 
     lora_trunk_frame_t invalid = beacon;
     invalid.fragment_total = 1;
@@ -261,9 +275,24 @@ static void test_neighbor_routes_and_collision(void)
     uint8_t route[8];
     uint16_t capabilities = 0;
 
+    /* One relay may advertise independently signed routes for several peers;
+     * this is not a radio-node identity collision. */
+    assert(lora_trunk_neighbor_learn_authenticated(
+               &table, SOURCE_B, SOURCE_A, key_a, false,
+               LORA_TRUNK_V3_CAP_PROTOCOL, 900) ==
+           LORA_TRUNK_NEIGHBOR_LEARNED);
+    assert(lora_trunk_neighbor_learn_authenticated(
+               &table, SOURCE_B, BOOT_A, key_b, false,
+               LORA_TRUNK_V3_CAP_PROTOCOL, 901) ==
+           LORA_TRUNK_NEIGHBOR_LEARNED);
+    assert(lora_trunk_neighbor_route(
+        &table, SOURCE_A, 950, 1000, route, NULL));
+    assert(memcmp(route, SOURCE_B, 8) == 0);
+
+    lora_trunk_neighbor_table_init(&table);
     assert(lora_trunk_neighbor_learn_authenticated(
                &table, SOURCE_A, SOURCE_A, key_a,
-               LORA_TRUNK_V3_CAP_PROTOCOL, 1000) ==
+               true, LORA_TRUNK_V3_CAP_PROTOCOL, 1000) ==
            LORA_TRUNK_NEIGHBOR_LEARNED);
     assert(lora_trunk_neighbor_route(
         &table, SOURCE_A, 1500, 1000, route, &capabilities));
@@ -274,7 +303,7 @@ static void test_neighbor_routes_and_collision(void)
 
     assert(lora_trunk_neighbor_learn_authenticated(
                &table, SOURCE_A, SOURCE_A, key_b,
-               LORA_TRUNK_V3_CAP_PROTOCOL, 2000) ==
+               true, LORA_TRUNK_V3_CAP_PROTOCOL, 2000) ==
            LORA_TRUNK_NEIGHBOR_COLLISION);
     assert(!lora_trunk_neighbor_route(
         &table, SOURCE_A, 2000, 1000, route, NULL));
@@ -287,7 +316,8 @@ static void test_neighbor_routes_and_collision(void)
         key[0] = (uint8_t)(i + 1);
         lora_trunk_neighbor_result_t result =
             lora_trunk_neighbor_learn_authenticated(
-                &table, node, node, key, LORA_TRUNK_V3_CAP_PROTOCOL, i);
+                &table, node, node, key, true,
+                LORA_TRUNK_V3_CAP_PROTOCOL, i);
         assert(i < LORA_TRUNK_NEIGHBOR_CAPACITY
                    ? result == LORA_TRUNK_NEIGHBOR_LEARNED
                    : result == LORA_TRUNK_NEIGHBOR_EVICTED);
@@ -303,7 +333,7 @@ static void test_neighbor_routes_and_collision(void)
         key[0] = (uint8_t)(i + 1);
         assert(lora_trunk_neighbor_learn_authenticated(
                    &table, node, node, key,
-                   LORA_TRUNK_V3_CAP_PROTOCOL, i) ==
+                   true, LORA_TRUNK_V3_CAP_PROTOCOL, i) ==
                LORA_TRUNK_NEIGHBOR_LEARNED);
         table.entries[i].quarantined = true;
     }
@@ -311,7 +341,7 @@ static void test_neighbor_routes_and_collision(void)
     uint8_t new_key[32] = {0xFE};
     assert(lora_trunk_neighbor_learn_authenticated(
                &table, new_node, new_node, new_key,
-               LORA_TRUNK_V3_CAP_PROTOCOL, 100) ==
+               true, LORA_TRUNK_V3_CAP_PROTOCOL, 100) ==
            LORA_TRUNK_NEIGHBOR_COLLISION);
 }
 

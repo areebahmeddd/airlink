@@ -74,11 +74,12 @@ menu "Bitle hardware"
         depends on IDF_TARGET_ESP32S3
         default n
         help
-            Test-only mode. After an authenticated v3 neighbor is discovered,
-            transmit synthetic addressed packets spanning one through five
-            fragments. Flash exactly one test node with this enabled and leave
-            receiving nodes on the normal build. Never enable it in deployed
-            firmware.
+            Test-only mode. First transmit three spaced synthetic broadcasts
+            that exercise same-medium forwarding, then after an authenticated
+            v3 neighbor is discovered transmit addressed packets spanning one
+            through five fragments. Flash exactly one test node with this
+            enabled and leave receiving nodes on the normal build. Never enable
+            it in deployed firmware.
 
     choice BITLE_LORA_REGION
         prompt "Default LoRa regional profile"

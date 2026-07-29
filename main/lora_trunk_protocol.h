@@ -111,6 +111,7 @@ typedef struct {
     bool in_use;
     bool quarantined;
     bool identity_authenticated;
+    bool direct_identity;
     uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN];
     uint8_t reachable_peer[LORA_TRUNK_V3_NODE_ID_LEN];
     uint8_t signing_key[LORA_TRUNK_SIGNING_KEY_LEN];
@@ -151,7 +152,7 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
     const uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN],
     const uint8_t reachable_peer[LORA_TRUNK_V3_NODE_ID_LEN],
     const uint8_t signing_key[LORA_TRUNK_SIGNING_KEY_LEN],
-    uint16_t capabilities, uint64_t now_ms);
+    bool direct_identity, uint16_t capabilities, uint64_t now_ms);
 
 /* Returns the freshest non-expired, non-quarantined route for a BitChat peer. */
 bool lora_trunk_neighbor_route(
@@ -160,6 +161,12 @@ bool lora_trunk_neighbor_route(
     uint64_t now_ms, uint64_t max_age_ms,
     uint8_t out_node_id[LORA_TRUNK_V3_NODE_ID_LEN],
     uint16_t *out_capabilities);
+
+/* Removes authenticated routes whose next hop failed terminal per-hop
+ * delivery. The next send falls back to broadcast discovery. */
+size_t lora_trunk_neighbor_forget_next_hop(
+    lora_trunk_neighbor_table_t *table,
+    const uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN]);
 
 size_t lora_trunk_neighbor_count(const lora_trunk_neighbor_table_t *table);
 

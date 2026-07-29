@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture concurrent LoRa diagnostics from two serial-connected nodes."""
+"""Capture concurrent LoRa diagnostics from serial-connected nodes."""
 
 from __future__ import annotations
 
@@ -21,6 +21,9 @@ RAW_RE = re.compile(
 TX_RE = re.compile(r"trunk (?:TX|accepted) .*len=(\d+) frags=(\d+)")
 SMOKE_RE = re.compile(
     r"diagnostic smoke enqueue len=(\d+) expected_frags=(\d+) addressed=(\d+)"
+)
+FORWARD_SMOKE_RE = re.compile(
+    r"diagnostic forwarding smoke enqueue len=(\d+) expected_frags=(\d+)"
 )
 PROFILE_RE = re.compile(r"trunk up: region=(\w+).* SF(\d+).*preamble=(\d+)")
 DIAG_RE = re.compile(
@@ -54,6 +57,16 @@ CHANNEL_DIAG_RE = re.compile(
     r"beacon=(\d+)/(\d+) stale=(\d+) budget=(\d+) "
     r"backoff=(\d+) announce_tx=(\d+)"
 )
+FORWARD_DIAG_RE = re.compile(
+    r"forward=(\d+) suppress=(\d+) dup_net=(\d+) "
+    r"hop_drop=(\d+) route_fail=(\d+)"
+)
+FORWARD_TX_RE = re.compile(
+    r"trunk accepted .*hops=(\d+)/(\d+) forwarded=(\d+)"
+)
+FORWARD_RX_RE = re.compile(
+    r"trunk v\d+ RX packet .*hops=(\d+)/(\d+)"
+)
 
 
 def reader(
@@ -79,12 +92,19 @@ def reader(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("ports", nargs=2, help="serial ports for the two nodes")
+    parser.add_argument(
+        "ports", nargs="+", help="serial ports for two or more nodes"
+    )
     parser.add_argument("--seconds", type=int, default=75)
     parser.add_argument("--json-out")
-    parser.add_argument("--reset", action="store_true", help="reset both nodes at capture start")
+    parser.add_argument(
+        "--reset", action="store_true",
+        help="reset all nodes at capture start",
+    )
     parser.add_argument("--quiet", action="store_true", help="print only the JSON summary")
     args = parser.parse_args()
+    if len(args.ports) < 2:
+        parser.error("at least two serial ports are required")
 
     messages: queue.Queue[tuple[str, str]] = queue.Queue()
     stop = threading.Event()
@@ -99,22 +119,15 @@ def main() -> int:
         thread.start()
 
     summary: dict[str, dict[str, object]] = {
-        "node-1": {
+        f"node-{index + 1}": {
             "rx_fragments": Counter(),
             "tx_fragments": Counter(),
             "raw": [],
             "events": Counter(),
             "diagnostics": [],
             "profile": None,
-        },
-        "node-2": {
-            "rx_fragments": Counter(),
-            "tx_fragments": Counter(),
-            "raw": [],
-            "events": Counter(),
-            "diagnostics": [],
-            "profile": None,
-        },
+        }
+        for index in range(len(args.ports))
     }
     deadline = time.monotonic() + args.seconds
     try:
@@ -132,6 +145,8 @@ def main() -> int:
             if match := SMOKE_RE.search(line):
                 mode = "addressed" if match.group(3) == "1" else "broadcast"
                 summary[label]["events"][f"smoke_{mode}"] += 1
+            if FORWARD_SMOKE_RE.search(line):
+                summary[label]["events"]["smoke_forwarding_broadcast"] += 1
             if match := RAW_RE.search(line):
                 summary[label]["raw"].append(
                     {
@@ -224,6 +239,22 @@ def main() -> int:
                     summary[label]["diagnostics"].append(
                         channel_diag
                     )
+            if match := FORWARD_DIAG_RE.search(line):
+                forward_diag = {
+                    "forwarded_packets": int(match.group(1)),
+                    "forward_suppressed": int(match.group(2)),
+                    "network_duplicates": int(match.group(3)),
+                    "hop_limit_drops": int(match.group(4)),
+                    "route_failures": int(match.group(5)),
+                }
+                if summary[label]["diagnostics"]:
+                    summary[label]["diagnostics"][-1].update(
+                        forward_diag
+                    )
+                else:
+                    summary[label]["diagnostics"].append(
+                        forward_diag
+                    )
             if "authenticated neighbor" in line:
                 summary[label]["events"]["authenticated_neighbor"] += 1
             if match := CONTROL_RE.search(line):
@@ -247,6 +278,20 @@ def main() -> int:
                 summary[label]["events"]["beacon_rx"] += 1
                 if int(match.group(2)) == 4:
                     summary[label]["events"]["beacon_stale"] += 1
+            if match := FORWARD_TX_RE.search(line):
+                if int(match.group(3)):
+                    summary[label]["events"]["forwarded_tx"] += 1
+                summary[label]["events"][
+                    f"tx_hops_{match.group(1)}_of_{match.group(2)}"
+                ] += 1
+            if match := FORWARD_RX_RE.search(line):
+                summary[label]["events"][
+                    f"rx_hops_{match.group(1)}_of_{match.group(2)}"
+                ] += 1
+            if "duplicate network packet" in line:
+                summary[label]["events"][
+                    "network_duplicate_suppressed"
+                ] += 1
             if "trunk transfer COMPLETE" in line:
                 summary[label]["events"]["transfer_complete"] += 1
             if "TX watchdog expired" in line:

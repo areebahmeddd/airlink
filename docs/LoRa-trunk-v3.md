@@ -28,8 +28,8 @@ existing short-frame RF behavior.
 | 4 | 1 | flags | Integrity-covered flags defined below |
 | 5 | 1 | header length | `44` |
 | 6 | 2 | capabilities | Sender capabilities |
-| 8 | 1 | hop limit | Remaining forwarding budget; `0` in milestone 3 |
-| 9 | 1 | hop count | Hops already crossed; `0` in milestone 3 |
+| 8 | 1 | hop limit | Maximum relay count; originated data defaults to `3` |
+| 9 | 1 | hop count | Relays already crossed; originated data starts at `0` |
 | 10 | 2 | payload length | Bytes following this header |
 | 12 | 8 | source | Full BitChat/Noise peer identifier |
 | 20 | 8 | destination | Full peer identifier; all zero means broadcast |
@@ -55,6 +55,8 @@ encoding makes accidental and malformed address modes detectable.
 
 Data frames require a nonzero source, nonzero transfer ID, a fragment total of
 at least one, an index below that total, and a payload length of at least one.
+The hop limit may not exceed four and the hop count may not exceed the limit.
+The legacy v3 one-hop encoding `0/0` remains valid but cannot be forwarded.
 Control frames require a nonzero source and destination, zero flags, zero
 payload, and a fragment total matching the transfer. Bitmap ACK values contain
 only bits below `fragment total`. COMPLETE contains the full received bitmap.
@@ -63,9 +65,12 @@ invalid total length, resource pressure, or radio reset.
 
 ## Node and transfer identity
 
-The source and destination are the complete eight-byte BitChat peer IDs derived
-from Noise static public keys. Version 3 never truncates them to the four-byte
-v2 radio tag.
+The source and destination are complete eight-byte BitChat peer IDs derived
+from Noise static public keys. For a forwarded frame they name the immediate
+LoRa sender and selected next hop, not the original BitChat sender and final
+BitChat recipient. Those end-to-end identities remain inside the encoded
+BitChat packet. Version 3 never truncates an outer node ID to the four-byte v2
+radio tag.
 
 A neighbor advertisement binds a node ID to the Ed25519 key in a successfully
 verified signed BitChat `ANNOUNCE`. The neighbor table stores that signing-key
@@ -75,13 +80,14 @@ direct route through the conflicting identity is selected. A later firmware
 may add an explicit collision-resolution exchange; milestone 3 fails closed.
 
 Each boot generates an unpredictable 64-bit boot epoch from the hardware random
-number generator. Every admitted packet appends a monotonically increasing
-32-bit counter, producing a 96-bit transfer ID. The counter advances only when
-the complete packet is committed to the scheduler. Reboots therefore do not
-reuse the preceding boot's transfer namespace except with negligible random
-collision probability. Reassembly is keyed by the complete tuple
-`(source, transfer ID)`, so equal counters or transfer bytes from different
-senders cannot alias.
+number generator. Every admitted per-hop packet appends a monotonically
+increasing 32-bit counter, producing a 96-bit transfer ID. The counter advances
+only when the complete packet is committed to the scheduler. A relay therefore
+creates a fresh transfer ID and selective-repeat session for its next hop.
+Reboots do not reuse the preceding boot's transfer namespace except with
+negligible random collision probability. Reassembly is keyed by the complete
+tuple `(source, transfer ID)`, so equal counters or transfer bytes from
+different senders cannot alias.
 
 ## Neighbor and route learning
 
@@ -90,14 +96,18 @@ only after all of the following are true:
 
 1. A complete v3 packet has been reassembled without parser errors.
 2. The encoded BitChat packet is an `ANNOUNCE`.
-3. Its BitChat sender equals the v3 radio source.
-4. The announce sender is derived from its advertised Noise static key.
-5. Its signature verifies with its advertised Ed25519 key.
+3. The announce sender is derived from its advertised Noise static key.
+4. Its signature verifies with its advertised Ed25519 key.
 
-An entry records the v3 source, the BitChat peer advertised as reachable,
-verified signing identity, capabilities, and last-seen time. Expired,
-quarantined, or conflicting entries are not routes. The bounded table evicts
-the oldest non-quarantined entry when full.
+An entry records the immediate v3 source as the next hop, the signed BitChat
+peer as the reachable destination, the verified signing identity,
+capabilities, and last-seen time. If the inner announce sender equals the
+outer source, the entry is a direct radio identity. Otherwise, the verified
+announce has crossed a relay and creates a reverse path to its signed origin
+through the immediate sender. One relay may therefore advertise several
+independently signed peers without being mistaken for an identity collision.
+Expired, quarantined, or conflicting entries are not routes. The bounded table
+evicts the oldest non-quarantined entry when full.
 
 For an encoded BitChat packet with a recipient, the sender uses the freshest
 authenticated neighbor that advertised that recipient. It emits addressed v3
@@ -107,9 +117,44 @@ still provide reachability. Packets without a recipient, including announces,
 are broadcasts.
 
 Discovery beacons use an independent randomized startup delay and interval
-jitter so peers booted together do not repeatedly collide. Milestone 5 extends
-this minimum discovery safeguard with broader loss-adaptation, duplicate
-suppression, and cadence policy.
+jitter so peers booted together do not repeatedly collide. Compact beacons
+identify only the direct radio neighbor; signed announces establish usable
+direct and multi-hop BitChat routes.
+
+## Bounded forwarding
+
+The generic mesh excludes an ingress link from ordinary rebroadcasts. LoRa
+registers an explicit same-medium relay callback so a packet received from
+LoRa can be sent back onto LoRa without weakening that rule for other
+transports.
+
+Locally originated v3 data uses a hop limit of three and a hop count of zero.
+Every relay preserves the limit and increments the count before creating its
+new per-hop transfer. A receiver may admit a same-medium relay only when the
+incoming count is below the limit. Limits above four, counts above the limit,
+and exhausted relays are rejected before the whole packet is committed to the
+TX scheduler. Application TTL remains independent and is still decremented by
+the generic BitChat relay.
+
+Each node keeps a 32-entry, five-minute forwarding cache keyed by the inner
+BitChat sender and a stable 64-bit fingerprint of the encoded packet. The
+fingerprint excludes the BitChat TTL byte, so every hop recognizes the same
+logical transfer. A duplicate is acknowledged at the outer per-hop layer when
+necessary, but it is not delivered to the application or forwarded again.
+The existing 64-entry BitChat mesh dedup remains a second safety layer.
+
+Broadcast relays wait for an airtime-scaled randomized delay before CAD. Better
+SNR receives a smaller quality penalty, so a strong or early relay tends to
+transmit first. If another copy is overheard while a matching broadcast relay
+is queued or waiting, the scheduled relay is released without TX. Addressed
+forwarding uses the freshest authenticated next-hop route and the normal
+bitmap/COMPLETE per-hop reliability exchange.
+
+Authenticated routes expire after three minutes. Terminal addressed delivery
+failure removes every route using the failed next hop; a later packet falls
+back to bounded broadcast and signed-announcement forwarding can repopulate
+the path. This avoids retaining a stale route without inventing unauthenticated
+reachability from arbitrary packet headers.
 
 ## Packet-level reliability
 

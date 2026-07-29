@@ -78,6 +78,11 @@ typedef struct {
     uint32_t beacon_budget_deferred;
     uint32_t channel_backoffs;
     uint32_t announce_tx;
+    uint32_t forwarded_packets;
+    uint32_t forward_suppressed;
+    uint32_t forward_duplicates;
+    uint32_t hop_limit_drops;
+    uint32_t route_failures;
 } bitle_lora_diag_t;
 
 /* Snapshot transport diagnostics. All counters are monotonic for the boot.

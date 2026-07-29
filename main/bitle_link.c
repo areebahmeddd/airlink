@@ -13,6 +13,7 @@ typedef struct {
     uint16_t handle;
     bitle_link_type_t type;
     bitle_link_send_fn_t send_fn;
+    bitle_link_relay_fn_t relay_fn;
     bitle_link_reserve_fn_t reserve_fn;
     bitle_link_commit_fn_t commit_fn;
     bitle_link_cancel_fn_t cancel_fn;
@@ -48,6 +49,17 @@ esp_err_t bitle_link_register_reservable(
     bitle_link_reserve_fn_t reserve_fn, bitle_link_commit_fn_t commit_fn,
     bitle_link_cancel_fn_t cancel_fn)
 {
+    return bitle_link_register_reservable_relay(
+        handle, type, send_fn, NULL, reserve_fn, commit_fn,
+        cancel_fn);
+}
+
+esp_err_t bitle_link_register_reservable_relay(
+    uint16_t handle, bitle_link_type_t type, bitle_link_send_fn_t send_fn,
+    bitle_link_relay_fn_t relay_fn,
+    bitle_link_reserve_fn_t reserve_fn, bitle_link_commit_fn_t commit_fn,
+    bitle_link_cancel_fn_t cancel_fn)
+{
     bool incomplete_reservation =
         (reserve_fn || commit_fn || cancel_fn) &&
         !(reserve_fn && commit_fn && cancel_fn);
@@ -73,6 +85,7 @@ esp_err_t bitle_link_register_reservable(
     e->handle = handle;
     e->type = type;
     e->send_fn = send_fn;
+    e->relay_fn = relay_fn;
     e->reserve_fn = reserve_fn;
     e->commit_fn = commit_fn;
     e->cancel_fn = cancel_fn;
@@ -231,6 +244,53 @@ int bitle_link_broadcast(uint16_t exclude_handle, const uint8_t *data, uint16_t 
         } else {
             ESP_LOGW(TAG, "broadcast send not accepted handle=%u result=%d",
                      targets[i].handle, result);
+        }
+    }
+    return sent;
+}
+
+int bitle_link_rebroadcast(
+    uint16_t source_handle, const uint8_t *data, uint16_t len)
+{
+    struct {
+        uint16_t handle;
+        bitle_link_send_fn_t fn;
+    } targets[BITLE_LINK_MAX];
+    size_t count = 0;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t index = 0; index < BITLE_LINK_MAX; ++index) {
+        if (!s_links[index].in_use) {
+            continue;
+        }
+        bitle_link_send_fn_t fn = s_links[index].send_fn;
+        if (s_links[index].handle == source_handle) {
+            fn = s_links[index].relay_fn;
+        }
+        if (fn) {
+            targets[count].handle = s_links[index].handle;
+            targets[count].fn = fn;
+            count++;
+        }
+    }
+    xSemaphoreGive(s_lock);
+
+    int sent = 0;
+    for (size_t index = 0; index < count; ++index) {
+        bitle_link_send_result_t result =
+            targets[index].fn(
+                targets[index].handle, data, len);
+        if (result == BITLE_LINK_SEND_ACCEPTED) {
+            sent++;
+        } else if (result == BITLE_LINK_SEND_POLICY_DROPPED) {
+            ESP_LOGD(
+                TAG, "rebroadcast policy drop handle=%u",
+                targets[index].handle);
+        } else {
+            ESP_LOGW(
+                TAG,
+                "rebroadcast send not accepted handle=%u result=%d",
+                targets[index].handle, result);
         }
     }
     return sent;
