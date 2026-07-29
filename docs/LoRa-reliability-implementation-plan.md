@@ -61,7 +61,7 @@ The implementation is complete only when all of the following are true:
 |---|---|---|---|
 | 0. Baseline harness and observability | Complete | `d130a3a` | Host baseline, both firmware targets, and two-board SF10 smoke passed |
 | 1. Airtime-safe SX1262 operation | Complete | `028511e` | Host/profile tests, both firmware targets, and SF10-SF12 two-board radio tests passed |
-| 2. Atomic packet scheduling and backpressure | Complete | pending checkpoint | Concurrent saturation, both firmware targets, and two-board SF10 smoke passed |
+| 2. Atomic packet scheduling and backpressure | Complete | `fe9e95e` | Concurrent saturation, both firmware targets, and two-board SF10 smoke passed |
 | 3. Addressed trunk protocol and migration | Pending | — | — |
 | 4. Packet-level reliability and reassembly | Pending | — | — |
 | 5. Discovery and shared-channel behavior | Pending | — | — |
@@ -274,7 +274,7 @@ give callers an honest transport result.
     every accepted descriptor was either released or visibly in flight.
   - Both test boards were restored to the normal SF10 image with diagnostic
     smoke disabled after the capture.
-- Commit: pending checkpoint
+- Commit: `fe9e95e`
 - Suggested commit subject: `refactor(lora): queue trunk packets atomically`
 
 ## Milestone 3: Addressed trunk protocol and migration
