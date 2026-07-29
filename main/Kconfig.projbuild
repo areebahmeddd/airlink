@@ -69,4 +69,14 @@ menu "Bitle hardware"
         depends on BITLE_DISPLAY
         default 10
 
+    config BITLE_LORA_DIAGNOSTIC_SMOKE
+        bool "Transmit LoRa diagnostic smoke packets"
+        depends on IDF_TARGET_ESP32S3
+        default n
+        help
+            Test-only mode. After the trunk starts, transmit synthetic packets
+            spanning one through five v2 fragments. Flash exactly one test node
+            with this enabled and leave receiving nodes on the normal build.
+            Never enable it in deployed firmware.
+
 endmenu

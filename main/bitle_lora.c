@@ -16,6 +16,7 @@
 #include "bitle_link.h"
 #include "bitle_mesh.h"
 #include "bitle_stats.h"
+#include "lora_airtime.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
 #include "sx1262.h"
@@ -133,6 +134,7 @@ static uint8_t s_sf;
 static uint32_t s_bw;
 static uint8_t s_cr;             /* denominator 5..8 => 4/5..4/8 */
 static bool s_ota_over_trunk;    /* OTA image chunks on the trunk (default off) */
+static bitle_lora_diag_t s_diag;
 
 static portMUX_TYPE s_gov_mux = portMUX_INITIALIZER_UNLOCKED;
 static double s_gov_credit_ms;
@@ -146,21 +148,36 @@ typedef struct {
 } throttle_t;
 static throttle_t s_throttle[THROTTLE_SLOTS];
 
-/* LoRa time-on-air (Semtech AN1200.13). Returns whole milliseconds. */
-static uint32_t lora_airtime_ms(uint16_t payload_len)
+/* Firmware wrapper around the host-testable Semtech time-on-air calculation. */
+static uint32_t trunk_airtime_ms(uint16_t payload_len)
 {
-    double tsym = (double)(1u << s_sf) / (double)s_bw;   /* seconds */
-    double tpre = (8.0 + 4.25) * tsym;
-    int de = ((s_sf >= 11 && s_bw == 125000) || (s_sf >= 12 && s_bw == 250000)) ? 1 : 0;
-    int cr = s_cr - 4;                                    /* 1..4 */
-    double num = 8.0 * payload_len - 4.0 * s_sf + 28.0 + 16.0; /* CRC on, explicit header */
-    double den = 4.0 * (s_sf - 2 * de);
-    double n = ceil(num / den) * (cr + 4);
-    if (n < 0) {
-        n = 0;
+    lora_airtime_params_t params = {
+        .spreading_factor = s_sf,
+        .bandwidth_hz = s_bw,
+        .coding_rate = s_cr,
+        .preamble_symbols = 8,
+        .explicit_header = true,
+        .crc_enabled = true,
+    };
+    return lora_airtime_ms(&params, payload_len);
+}
+
+static void diag_inc(uint32_t *counter)
+{
+    taskENTER_CRITICAL(&s_gov_mux);
+    (*counter)++;
+    taskEXIT_CRITICAL(&s_gov_mux);
+}
+
+static void diag_note_queue_depth(void)
+{
+    uint32_t depth = s_tx_queue ? uxQueueMessagesWaiting(s_tx_queue) : 0;
+    taskENTER_CRITICAL(&s_gov_mux);
+    s_diag.queue_depth = depth;
+    if (depth > s_diag.queue_high_water) {
+        s_diag.queue_high_water = depth;
     }
-    double t = tpre + (8.0 + n) * tsym;
-    return (uint32_t)(t * 1000.0 + 0.5);
+    taskEXIT_CRITICAL(&s_gov_mux);
 }
 
 /* Per-origin announce throttle (call inside the governor critical section).
@@ -228,7 +245,7 @@ static bool trunk_admit(const uint8_t *data, uint16_t len)
     for (uint8_t i = 0; i < total; ++i) {
         uint16_t off = (uint16_t)i * TRUNK_CHUNK_TX;
         uint16_t chunk = len - off < TRUNK_CHUNK_TX ? len - off : TRUNK_CHUNK_TX;
-        airtime += lora_airtime_ms(TRUNK_HDR_LEN + chunk);
+        airtime += trunk_airtime_ms(TRUNK_HDR_LEN + chunk);
     }
 
     taskENTER_CRITICAL(&s_gov_mux);
@@ -369,9 +386,12 @@ static int lora_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
         frame.len = TRUNK_HDR_LEN + chunk;
         frame.want_ack = want_ack;
         if (xQueueSend(s_tx_queue, &frame, 0) != pdTRUE) {
+            diag_inc(&s_diag.queue_full);
+            diag_note_queue_depth();
             ESP_LOGW(TAG, "TX queue full; dropping packet seq=%u", seq);
             return -1;
         }
+        diag_note_queue_depth();
     }
     return 0;
 }
@@ -425,6 +445,8 @@ static bool transmit_ack_now(void)
     s_ack_head = (s_ack_head + 1) % ACK_OUTBOX;
     s_ack_count--;
     if (sx1262_transmit(f, TRUNK_HDR_LEN) == ESP_OK) {
+        diag_inc(&s_diag.tx_attempts);
+        diag_inc(&s_diag.ack_tx);
         ESP_LOGI(TAG, "ack TX seq=%u idx=%u", a->seq, a->idx);
         return true;
     }
@@ -441,6 +463,9 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
     if (memcmp(f + 4, s_src_tag, 4) == 0) {
         return; /* our own transmission echoed */
     }
+    diag_inc(&s_diag.raw_rx_frames);
+    ESP_LOGI(TAG, "trunk raw RX len=%u rssi=%d snr=%d ftype=0x%02X",
+             len, rssi, snr, f[3]);
     uint16_t seq = ((uint16_t)f[12] << 8) | f[13];
     uint8_t idx = f[14], total = f[15];
 
@@ -450,6 +475,7 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
             s_ack_seen = true;
             s_ack_seq = seq;
             s_ack_idx = idx;
+            diag_inc(&s_diag.ack_rx);
             ESP_LOGI(TAG, "ack RX seq=%u idx=%u", seq, idx);
         }
         return;
@@ -475,6 +501,7 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
         rx_slot_t *s = &s_rx_slots[i];
         if (s->in_use && now - s->started_ms > RX_TIMEOUT_MS) {
             s->in_use = false;
+            diag_inc(&s_diag.reassembly_expiry);
         }
         if (s->in_use && s->seq == seq && memcmp(s->src, f + 4, 4) == 0) {
             slot = s;
@@ -518,6 +545,7 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
     }
     slot->in_use = false;
 
+    diag_inc(&s_diag.completed_packets);
     ESP_LOGI(TAG, "trunk RX packet len=%u rssi=%d snr=%d frags=%u", plen, rssi, snr, total);
     bitle_mesh_inbound(BITLE_LORA_LINK_HANDLE, packet, plen);
 }
@@ -540,6 +568,12 @@ static void lora_task(void *arg)
     bool awaiting_ack = false;
     uint64_t ack_deadline = 0;
     uint64_t next_beacon_ms = BEACON_FIRST_MS;
+    uint64_t next_diag_ms = 60000ULL;
+#if CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE
+    static const uint16_t smoke_lengths[] = {100, 180, 300, 420, 520};
+    size_t smoke_index = 0;
+    uint64_t next_smoke_ms = 12000ULL;
+#endif
 
     while (true) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
@@ -550,6 +584,52 @@ static void lora_task(void *arg)
             if (noise_announce_link(BITLE_LORA_LINK_HANDLE)) {
                 ESP_LOGI(TAG, "trunk beacon sent");
             }
+        }
+
+#if CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE
+        if (smoke_index < sizeof(smoke_lengths) / sizeof(smoke_lengths[0]) &&
+            now >= next_smoke_ms) {
+            static uint8_t probe[BITCHAT_BLE_MAX_PACKET_SIZE];
+            uint16_t probe_len = smoke_lengths[smoke_index];
+            memset(probe, 0xA5, probe_len);
+            probe[0] = 1;
+            probe[1] = BITCHAT_MSG_MESSAGE;
+            probe[2] = 0;
+            probe[11] = 0;
+            uint16_t payload_len = probe_len - 22;
+            probe[12] = payload_len >> 8;
+            probe[13] = payload_len & 0xFF;
+            memcpy(probe + PKT_SENDER_OFF, noise_get_local_peer_id(), 8);
+            ESP_LOGI(TAG, "diagnostic smoke enqueue len=%u expected_frags=%u",
+                     probe_len, (probe_len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
+            lora_link_send(BITLE_LORA_LINK_HANDLE, probe, probe_len);
+            smoke_index++;
+            next_smoke_ms = now + 12000ULL;
+        }
+#endif
+
+        if (now >= next_diag_ms) {
+            bitle_lora_diag_t diag;
+            bitle_lora_get_diag(&diag);
+            ESP_LOGI(TAG,
+                     "diag raw_rx=%lu crc=%lu tx=%lu tmo=%lu ack_rx=%lu ack_tx=%lu "
+                     "ack_miss=%lu retry=%lu exhausted=%lu q_full=%lu q=%lu/%lu "
+                     "rx_expire=%lu complete=%lu",
+                     (unsigned long)diag.raw_rx_frames,
+                     (unsigned long)diag.crc_errors,
+                     (unsigned long)diag.tx_attempts,
+                     (unsigned long)diag.tx_timeouts,
+                     (unsigned long)diag.ack_rx,
+                     (unsigned long)diag.ack_tx,
+                     (unsigned long)diag.ack_misses,
+                     (unsigned long)diag.retries,
+                     (unsigned long)diag.retry_exhaustion,
+                     (unsigned long)diag.queue_full,
+                     (unsigned long)diag.queue_depth,
+                     (unsigned long)diag.queue_high_water,
+                     (unsigned long)diag.reassembly_expiry,
+                     (unsigned long)diag.completed_packets);
+            next_diag_ms = now + 60000ULL;
         }
 
         sx1262_event_t evt;
@@ -573,14 +653,14 @@ static void lora_task(void *arg)
                      * data frame's ack wait, so extend its deadline */
                     tx_is_ack = false;
                     if (awaiting_ack) {
-                        ack_deadline += lora_airtime_ms(TRUNK_HDR_LEN) + 300;
+                        ack_deadline += trunk_airtime_ms(TRUNK_HDR_LEN) + 300;
                     }
                 } else if (have_pending && pending.want_ack) {
                     /* wait long enough for the peer's ack (its airtime plus
                      * CAD/scheduling slack) before retransmitting */
                     awaiting_ack = true;
                     ack_deadline = esp_timer_get_time() / 1000ULL +
-                                   lora_airtime_ms(TRUNK_HDR_LEN) + ARQ_MARGIN_MS;
+                                   trunk_airtime_ms(TRUNK_HDR_LEN) + ARQ_MARGIN_MS;
                 } else {
                     have_pending = false;
                 }
@@ -595,6 +675,10 @@ static void lora_task(void *arg)
                     }
                 } else if (have_pending) {
                     if (sx1262_transmit(pending.data, pending.len) == ESP_OK) {
+                        diag_inc(&s_diag.tx_attempts);
+                        if (arq_sends > 0) {
+                            diag_inc(&s_diag.retries);
+                        }
                         awaiting_tx_done = true;
                         arq_sends++;
                     } else {
@@ -618,12 +702,14 @@ static void lora_task(void *arg)
                 }
                 break;
             case SX1262_EVT_TIMEOUT:
+                diag_inc(&s_diag.tx_timeouts);
                 awaiting_tx_done = false;
                 have_pending = false;
                 awaiting_ack = false;
                 sx1262_resume_rx();
                 break;
             case SX1262_EVT_RX_CRC_ERROR:
+                diag_inc(&s_diag.crc_errors);
                 /* Logged for link-quality visibility: a frame arrived but
                  * was corrupted in flight. */
                 ESP_LOGI(TAG, "trunk RX CRC error");
@@ -652,6 +738,7 @@ static void lora_task(void *arg)
                 awaiting_ack = false;
                 have_pending = false;
             } else if (now2 >= ack_deadline) {
+                diag_inc(&s_diag.ack_misses);
                 awaiting_ack = false;
                 if (arq_sends < ARQ_TRIES) {
                     cad_tries = 0;
@@ -661,6 +748,7 @@ static void lora_task(void *arg)
                         have_pending = false;
                     }
                 } else {
+                    diag_inc(&s_diag.retry_exhaustion);
                     ESP_LOGW(TAG, "trunk frame lost after %d sends seq=%u idx=%u",
                              ARQ_TRIES, pseq, pidx);
                     have_pending = false;
@@ -683,6 +771,7 @@ static void lora_task(void *arg)
 
         if (!have_pending && !awaiting_tx_done && !awaiting_cad && !awaiting_ack &&
             xQueueReceive(s_tx_queue, &pending, 0) == pdTRUE) {
+            diag_note_queue_depth();
             have_pending = true;
             cad_tries = 0;
             arq_sends = 0;
@@ -699,6 +788,19 @@ static void lora_task(void *arg)
 bool bitle_lora_active(void)
 {
     return s_active;
+}
+
+void bitle_lora_get_diag(bitle_lora_diag_t *out)
+{
+    if (!out) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_gov_mux);
+    *out = s_diag;
+    taskEXIT_CRITICAL(&s_gov_mux);
+    if (s_tx_queue) {
+        out->queue_depth = uxQueueMessagesWaiting(s_tx_queue);
+    }
 }
 
 esp_err_t bitle_lora_init(void)

@@ -9,6 +9,7 @@ idf_component_register(
         "bitle_link.c"
         "bitle_mesh.c"
         "bitle_lora.c"
+        "lora_airtime.c"
         "sx1262.c"
         "bitle_ota.c"
         "bitle_store.c"

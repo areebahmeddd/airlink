@@ -17,6 +17,7 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,27 @@ extern "C" {
 esp_err_t bitle_lora_init(void);
 
 bool bitle_lora_active(void);
+
+typedef struct {
+    uint32_t raw_rx_frames;
+    uint32_t crc_errors;
+    uint32_t tx_attempts;
+    uint32_t tx_timeouts;
+    uint32_t ack_rx;
+    uint32_t ack_tx;
+    uint32_t ack_misses;
+    uint32_t retries;
+    uint32_t retry_exhaustion;
+    uint32_t queue_full;
+    uint32_t reassembly_expiry;
+    uint32_t completed_packets;
+    uint32_t queue_depth;
+    uint32_t queue_high_water;
+} bitle_lora_diag_t;
+
+/* Snapshot transport diagnostics. All counters are monotonic for the boot.
+ * Safe before radio initialization; the returned structure will be zeroed. */
+void bitle_lora_get_diag(bitle_lora_diag_t *out);
 
 #ifdef __cplusplus
 }
