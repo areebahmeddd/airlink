@@ -60,7 +60,7 @@ The implementation is complete only when all of the following are true:
 | Milestone | Status | Commit | Evidence summary |
 |---|---|---|---|
 | 0. Baseline harness and observability | Complete | `d130a3a` | Host baseline, both firmware targets, and two-board SF10 smoke passed |
-| 1. Airtime-safe SX1262 operation | Complete | Pending checkpoint | Host/profile tests, both firmware targets, and SF10-SF12 two-board radio tests passed |
+| 1. Airtime-safe SX1262 operation | Complete | `028511e` | Host/profile tests, both firmware targets, and SF10-SF12 two-board radio tests passed |
 | 2. Atomic packet scheduling and backpressure | Pending | — | — |
 | 3. Addressed trunk protocol and migration | Pending | — | — |
 | 4. Packet-level reliability and reassembly | Pending | — | — |
@@ -194,7 +194,7 @@ for the configured frame size.
   - Radio initialization now verifies boosted RX gain and the 140 mA PA
     over-current setting by register readback. Receive gain is rechecked every
     time continuous RX is resumed.
-- Commit: Pending checkpoint
+- Commit: `028511e`
 - Suggested commit subject: `fix(lora): make SX1262 operation airtime safe`
 
 ## Milestone 2: Atomic packet scheduling and backpressure
