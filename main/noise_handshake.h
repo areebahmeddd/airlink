@@ -101,6 +101,12 @@ esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, c
  * (used by the LoRa trunk for neighbor beacons). */
 bool noise_announce_link(uint16_t link_handle);
 
+/* Local node's nickname (e.g. "Bitle-9550"), for the status display. */
+const char *noise_get_nickname(void);
+
+/* Direct peers with a verified announced identity. */
+int noise_verified_peer_count(void);
+
 /* Identity of the direct peer on a connection, learned from its announce.
  * Returns false until a direct announce has been parsed. *verified reflects
  * whether the announce's Ed25519 packet signature checked out. */

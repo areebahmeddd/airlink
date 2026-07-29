@@ -8,11 +8,13 @@
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
 #include "bitle_courier.h"
+#include "bitle_display.h"
 #include "bitle_hash.h"
 #include "bitle_link.h"
 #include "bitle_lora.h"
 #include "bitle_mesh.h"
 #include "bitle_ota.h"
+#include "bitle_stats.h"
 #include "bitle_sync.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
@@ -73,6 +75,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(bitle_link_init());
     ESP_ERROR_CHECK(bitle_mesh_init());
+    bitle_stats_init();
     /* Radio-optional: probes for an SX1262 and brings the LoRa trunk up
      * when present; C3 nodes and bare S3s continue BLE-only. */
     ESP_ERROR_CHECK(bitle_lora_init());
@@ -85,6 +88,10 @@ void app_main(void)
     ESP_ERROR_CHECK(bitchat_ble_init());
     ESP_ERROR_CHECK(bitchat_ble_start());
 #endif
+
+    /* Display-optional: probes for an SSD1306 OLED and starts the status
+     * screen when present; headless nodes continue without it. */
+    ESP_ERROR_CHECK(bitle_display_init());
 
     xTaskCreate(bitle_main_task, "bitle_main", 8192, NULL, tskIDLE_PRIORITY + 5, NULL);
 }

@@ -685,6 +685,19 @@ bool bitchat_ble_conn_is_central(uint16_t conn_handle)
     return state && state->is_central;
 }
 
+int bitchat_ble_link_count(void)
+{
+    int count = 0;
+    portENTER_CRITICAL(&s_conn_mux);
+    for (size_t i = 0; i < BITLE_BLE_MAX_CONNECTIONS; ++i) {
+        if (s_connections[i].in_use) {
+            count++;
+        }
+    }
+    portEXIT_CRITICAL(&s_conn_mux);
+    return count;
+}
+
 void bitchat_ble_disconnect(uint16_t conn_handle)
 {
     ble_conn_state_t *state = find_conn(conn_handle);

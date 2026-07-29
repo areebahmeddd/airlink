@@ -34,6 +34,11 @@ __pycache__/
 # Logs and scratch
 *.log
 
+# Display simulator outputs
+tools/screen_sim
+tools/frame_*.png
+tools/font.png
+
 # OTA: signed manifests are release artifacts; the owner private key must
 # never be committed (it lives outside the repo).
 *.bota

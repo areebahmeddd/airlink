@@ -33,4 +33,40 @@ menu "Bitle hardware"
             peripheral rail ("Vext"). GPIO number that enables the rail,
             driven active-high at boot; -1 when the radio is always powered.
 
+    config BITLE_DISPLAY
+        bool "SSD1306 status display (auto-detected)"
+        depends on IDF_TARGET_ESP32S3
+        default y if BITLE_LORA_BOARD_HELTEC_V3
+        default n
+        help
+            128x64 OLED showing nickname, link/peer counts and a live
+            activity tape. Probed on I2C at boot; with no display present
+            the node runs headless. The OLED shares the Vext rail with the
+            radio on Heltec boards and powers it the same way.
+
+    config BITLE_DISPLAY_PIN_SDA
+        int "Display I2C SDA GPIO"
+        depends on BITLE_DISPLAY
+        default 17
+
+    config BITLE_DISPLAY_PIN_SCL
+        int "Display I2C SCL GPIO"
+        depends on BITLE_DISPLAY
+        default 18
+
+    config BITLE_DISPLAY_PIN_RST
+        int "Display reset GPIO (-1 = none)"
+        depends on BITLE_DISPLAY
+        default 21
+
+    config BITLE_DISPLAY_BUTTON_PIN
+        int "User/wake button GPIO, active low (-1 = none)"
+        depends on BITLE_DISPLAY
+        default 0
+
+    config BITLE_DISPLAY_ON_SECS
+        int "Display wake time after boot/button press (seconds)"
+        depends on BITLE_DISPLAY
+        default 10
+
 endmenu

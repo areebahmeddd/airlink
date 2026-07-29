@@ -15,6 +15,7 @@
 #include "bitchat_ble.h"
 #include "bitle_link.h"
 #include "bitle_mesh.h"
+#include "bitle_stats.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
 #include "sx1262.h"
@@ -340,6 +341,7 @@ static int lora_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
                       type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE);
     uint8_t total = (uint8_t)((len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
     ESP_LOGI(TAG, "trunk TX type=0x%02X len=%u frags=%u arq=%d", type, len, total, want_ack);
+    bitle_stats_note_activity(BITLE_LANE_TRUNK, 1);
     /* Atomic across concurrent callers (NimBLE host, noise worker, lora_task
      * beacon): a duplicated seq would collide two packets into one remote
      * reassembly slot and corrupt both. Unique seq is sufficient — the

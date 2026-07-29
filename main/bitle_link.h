@@ -49,6 +49,9 @@ esp_err_t bitle_link_register(uint16_t handle, bitle_link_type_t type, bitle_lin
 void bitle_link_unregister(uint16_t handle);
 bool bitle_link_ready(uint16_t handle);
 
+/* Link type for a registered handle, or -1 when unknown. */
+int bitle_link_type_of(uint16_t handle);
+
 esp_err_t bitle_link_send(uint16_t handle, const uint8_t *data, uint16_t len);
 
 /* Sends to every registered link except exclude_handle (BITLE_LINK_NONE to

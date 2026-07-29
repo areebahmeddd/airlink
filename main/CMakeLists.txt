@@ -14,8 +14,11 @@ idf_component_register(
         "bitle_store.c"
         "bitle_courier.c"
         "bitle_sync.c"
+        "bitle_stats.c"
+        "bitle_screen.c"
+        "bitle_display.c"
     INCLUDE_DIRS "."
-    REQUIRES bt nvs_flash noise_ref mbedtls bitchat_utils app_update esp_partition esp_driver_gpio esp_driver_spi
+    REQUIRES bt nvs_flash noise_ref mbedtls bitchat_utils app_update esp_partition esp_driver_gpio esp_driver_spi esp_driver_i2c
 )
 
 target_include_directories(${COMPONENT_LIB} PRIVATE

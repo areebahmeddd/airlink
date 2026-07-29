@@ -1756,9 +1756,24 @@ esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, c
     return bitle_link_send(conn_handle, buffer, (uint16_t)encoded_len);
 }
 
-bool noise_get_peer_identity(uint16_t conn_handle, uint8_t noise_key[32], uint8_t sign_key[32], bool *verified)
+const char *noise_get_nickname(void)
 {
-    noise_session_t *session = find_session(conn_handle);
+    return s_nickname;
+}
+
+int noise_verified_peer_count(void)
+{
+    int count = 0;
+    for (size_t i = 0; i < NOISE_MAX_SESSIONS; ++i) {
+        if (s_identities[i].valid && s_identities[i].verified) {
+            count++;
+        }
+    }
+    return count;
+}
+
+bool noise_get_peer_identity(uint16_t conn_handle, uint8_t noise_key[32], uint8_t sign_key[32], bool *verified)
+{    noise_session_t *session = find_session(conn_handle);
     if (!session) {
         return false;
     }

@@ -11,6 +11,7 @@
 #include "bitchat_time.h"
 #include "bitle_link.h"
 #include "bitle_ota.h"
+#include "bitle_stats.h"
 #include "bitle_sync.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
@@ -290,6 +291,8 @@ static void relay_packet(uint16_t src_link, uint8_t *buffer, uint16_t len, const
 
     int forwarded = bitle_link_broadcast(src_link, buffer, len);
     if (forwarded > 0) {
+        bitle_stats_note_tx();
+        bitle_stats_note_activity(BITLE_LANE_FWD, 1);
         ESP_LOGI(TAG, "Relayed type=0x%02X ttl=%u to %d link(s)", packet->type, buffer[2], forwarded);
     }
 }
@@ -319,6 +322,14 @@ bool bitle_mesh_inbound(uint16_t link_handle, uint8_t *buffer, uint16_t len)
         ESP_LOGD(TAG, "duplicate packet dropped (type=0x%02X)", packet.type);
         bitchat_packet_free(&packet);
         return true;
+    }
+    /* Display bookkeeping: unique arrivals by link, discovered announce
+     * senders (direct and relayed alike). */
+    bitle_stats_note_rx();
+    bitle_stats_note_activity(
+        bitle_link_type_of(link_handle) == BITLE_LINK_LORA ? BITLE_LANE_TRUNK : BITLE_LANE_BLE, 0);
+    if (packet.type == BITCHAT_MSG_ANNOUNCE) {
+        bitle_stats_note_peer(packet.sender_id);
     }
     dispatch_packet(link_handle, &packet);
     /* Dead-drop: keep recent signed public packets so passing phones can
