@@ -158,6 +158,71 @@ static void test_two_senders_and_broadcast(void)
     }
 }
 
+static void test_compact_beacon_and_identity_separation(void)
+{
+    lora_trunk_frame_t beacon;
+    assert(lora_trunk_beacon_init(
+        &beacon, SOURCE_A, BOOT_A, 7, 1,
+        LORA_TRUNK_V3_CAP_PROTOCOL));
+    uint8_t wire[255];
+    size_t len = encode(&beacon, wire);
+    assert(len == LORA_TRUNK_V3_HEADER_LEN);
+
+    lora_trunk_frame_t parsed;
+    assert(lora_trunk_parse(wire, len, &parsed) ==
+           LORA_TRUNK_PARSE_OK);
+    assert(parsed.kind == LORA_TRUNK_KIND_BEACON);
+    uint8_t region = 0;
+    uint32_t freshness = 0;
+    assert(lora_trunk_beacon_fields(
+        &parsed, &region, &freshness));
+    assert(region == 1);
+    assert(freshness == 7);
+
+    lora_trunk_neighbor_table_t table;
+    lora_trunk_neighbor_table_init(&table);
+    assert(lora_trunk_neighbor_learn_beacon(
+               &table, parsed.source, parsed.transfer_id,
+               freshness, region, parsed.capabilities, 1000) ==
+           LORA_TRUNK_NEIGHBOR_LEARNED);
+    assert(lora_trunk_neighbor_count(&table) == 1);
+    assert(!table.entries[0].identity_authenticated);
+
+    uint8_t route[8] = {0};
+    assert(!lora_trunk_neighbor_route(
+        &table, SOURCE_A, 1000, 5000, route, NULL));
+    assert(lora_trunk_neighbor_learn_beacon(
+               &table, parsed.source, parsed.transfer_id,
+               freshness, region, parsed.capabilities, 1100) ==
+           LORA_TRUNK_NEIGHBOR_STALE);
+    assert(lora_trunk_neighbor_learn_beacon(
+               &table, parsed.source, parsed.transfer_id,
+               freshness + 1, region, parsed.capabilities, 1200) ==
+           LORA_TRUNK_NEIGHBOR_REFRESHED);
+
+    uint8_t key[32] = {1};
+    assert(lora_trunk_neighbor_learn_authenticated(
+               &table, SOURCE_A, SOURCE_A, key,
+               LORA_TRUNK_V3_CAP_PROTOCOL, 1300) ==
+           LORA_TRUNK_NEIGHBOR_LEARNED);
+    assert(table.entries[0].identity_authenticated);
+    assert(lora_trunk_neighbor_route(
+        &table, SOURCE_A, 1400, 5000, route, NULL));
+
+    lora_trunk_frame_t invalid = beacon;
+    invalid.fragment_total = 1;
+    assert(!lora_trunk_v3_encode(
+        &invalid, wire, sizeof(wire), &len));
+    invalid = beacon;
+    invalid.flags = LORA_TRUNK_V3_FLAG_ACK_REQUESTED;
+    assert(!lora_trunk_v3_encode(
+        &invalid, wire, sizeof(wire), &len));
+    uint8_t zero_epoch[8] = {0};
+    assert(!lora_trunk_beacon_init(
+        &invalid, SOURCE_A, zero_epoch, 1, 0,
+        LORA_TRUNK_V3_CAP_PROTOCOL));
+}
+
 static void test_v2_policy(void)
 {
     uint8_t data[17] = {
@@ -285,6 +350,7 @@ int main(void)
     test_v3_round_trip_and_malformed();
     test_exact_control_matching();
     test_two_senders_and_broadcast();
+    test_compact_beacon_and_identity_separation();
     test_v2_policy();
     test_neighbor_routes_and_collision();
     test_deterministic_parser_fuzz();

@@ -64,7 +64,7 @@ The implementation is complete only when all of the following are true:
 | 2. Atomic packet scheduling and backpressure | Complete | `fe9e95e` | Concurrent saturation, both firmware targets, and two-board SF10 smoke passed |
 | 3. Addressed trunk protocol and migration | Complete | `3ee5843` | v2/v3 host protocol suite, both firmware targets, and addressed two-board v3 smoke passed |
 | 4. Packet-level reliability and reassembly | Complete | `33cfde3` | 99.35% sender completion at 30% data/feedback loss; five-of-five two-board transfer gate |
-| 5. Discovery and shared-channel behavior | Pending | — | — |
+| 5. Discovery and shared-channel behavior | Complete | Pending checkpoint | 100% simulated discovery; three-repeat two-board beacon gate passed |
 | 6. LoRa multi-hop forwarding | Pending | — | — |
 | 7. Link adaptation and PHY hardening | Pending | — | — |
 | 8. End-to-end validation and rollout | Pending | — | — |
@@ -433,23 +433,23 @@ traffic from repeatedly colliding.
 
 ### Checklist
 
-- [ ] Define a compact, single-frame trunk discovery beacon containing node ID,
+- [x] Define a compact, single-frame trunk discovery beacon containing node ID,
       protocol version, capabilities, regional profile, and a freshness value.
-- [ ] Keep BitChat identity and signed application announces separate from
+- [x] Keep BitChat identity and signed application announces separate from
       minimum viable trunk-neighbor discovery.
-- [ ] Randomize first-beacon and periodic-beacon timing.
-- [ ] Add controlled beacon repetition or another bounded reliability mechanism
+- [x] Randomize first-beacon and periodic-beacon timing.
+- [x] Add controlled beacon repetition or another bounded reliability mechanism
       that does not create ACK implosion.
-- [ ] Make announce throttling aware of whether a previous announce was actually
+- [x] Make announce throttling aware of whether a previous announce was actually
       admitted and transmitted.
-- [ ] Scale contention windows to packet airtime rather than using a fixed
+- [x] Scale contention windows to packet airtime rather than using a fixed
       30–150 ms interval.
-- [ ] Recheck CAD immediately before TX after the backoff expires.
-- [ ] Keep the radio in RX during software backoff whenever the SX1262 mode
+- [x] Recheck CAD immediately before TX after the backoff expires.
+- [x] Keep the radio in RX during software backoff whenever the SX1262 mode
       permits it.
-- [ ] Add ACK priority without allowing an unlimited ACK stream to starve data.
-- [ ] Add randomized scheduling for relays that hear the same broadcast.
-- [ ] Test hidden-terminal, simultaneous-beacon, bidirectional-data, and
+- [x] Add ACK priority without allowing an unlimited ACK stream to starve data.
+- [x] Add randomized scheduling for relays that hear the same broadcast.
+- [x] Test hidden-terminal, simultaneous-beacon, bidirectional-data, and
       four-receiver scenarios.
 
 ### Success criteria
@@ -465,9 +465,43 @@ traffic from repeatedly colliding.
 
 ### Milestone record
 
-- Status: Pending
+- Status: Complete
 - Evidence:
-- Commit:
+  - Trunk v3 now defines an exact 44-byte discovery beacon. The existing
+    header carries protocol version, capabilities, the eight-byte radio node
+    ID, an eight-byte boot epoch, a wrap-safe 32-bit freshness counter, and
+    the regional profile. Beacon semantics prohibit payloads, destinations,
+    and ACK requests.
+  - Minimum radio reachability is learned separately from signed BitChat/Noise
+    identity. An unauthenticated beacon cannot create an addressed BitChat
+    route; a subsequently verified signed announce attaches identity to the
+    existing radio-neighbor entry.
+  - Each randomized beacon interval emits three independently delayed,
+    budgeted copies without receiver ACKs. Repeated freshness values are
+    classified as stale, and a new boot epoch safely starts a new sequence.
+    Signed application announces retain their own randomized schedule and
+    advance their throttle only after the complete packet is transmitted.
+  - The fixed blocking CAD delay is replaced by a nonblocking, airtime-scaled
+    contention deadline. The SX1262 stays in continuous RX during backoff,
+    performs CAD immediately before TX, expands the window after busy results,
+    and gives relayed broadcasts an additional randomized defer. ACKs preempt
+    promptly but are capped at four consecutive controls before packet traffic
+    receives an opportunity.
+  - The portable host suite passes 20 tests. Across 100 deterministic
+    four-node seeds with 30% independent beacon loss, all radio-neighbor pairs
+    were discovered within three intervals (100% mean and minimum, exceeding
+    the 95% gate). Simultaneous boot, hidden senders, bidirectional ACK/data
+    service, four receivers, airtime budget, route retention, wire validation,
+    freshness, and identity separation are covered.
+  - ESP-IDF 6.0 builds pass for the normal Heltec V3 ESP32-S3 configuration
+    and the BLE-only ESP32-C3 target.
+  - In the final 68-second SF10 two-board capture, both nodes transmitted a
+    complete three-copy beacon burst and received the peer's compact beacon.
+    No beacon requested or produced a control ACK. Both nodes reported zero
+    radio timeouts, radio-command errors, BUSY timeouts, recovery failures,
+    and software-watchdog recoveries; channel-backoff and airtime-budget
+    counters were active.
+- Commit: Pending checkpoint
 - Suggested commit subject: `feat(lora): harden discovery and channel access`
 
 ## Milestone 6: LoRa multi-hop forwarding

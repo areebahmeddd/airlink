@@ -44,6 +44,16 @@ RELIABILITY_DIAG_RE = re.compile(
 CONTROL_RE = re.compile(
     r"v3 control (TX|RX) kind=(\d+) value=0x([0-9a-fA-F]{2})"
 )
+BEACON_TX_RE = re.compile(
+    r"trunk beacon TX freshness=(\d+) repeat=(\d+)"
+)
+BEACON_RX_RE = re.compile(
+    r"trunk beacon RX freshness=(\d+) result=(\d+)"
+)
+CHANNEL_DIAG_RE = re.compile(
+    r"beacon=(\d+)/(\d+) stale=(\d+) budget=(\d+) "
+    r"backoff=(\d+) announce_tx=(\d+)"
+)
 
 
 def reader(
@@ -197,6 +207,23 @@ def main() -> int:
                     summary[label]["diagnostics"].append(
                         reliability_diag
                     )
+            if match := CHANNEL_DIAG_RE.search(line):
+                channel_diag = {
+                    "beacon_tx": int(match.group(1)),
+                    "beacon_rx": int(match.group(2)),
+                    "beacon_stale": int(match.group(3)),
+                    "beacon_budget_deferred": int(match.group(4)),
+                    "channel_backoffs": int(match.group(5)),
+                    "announce_tx": int(match.group(6)),
+                }
+                if summary[label]["diagnostics"]:
+                    summary[label]["diagnostics"][-1].update(
+                        channel_diag
+                    )
+                else:
+                    summary[label]["diagnostics"].append(
+                        channel_diag
+                    )
             if "authenticated neighbor" in line:
                 summary[label]["events"]["authenticated_neighbor"] += 1
             if match := CONTROL_RE.search(line):
@@ -211,6 +238,15 @@ def main() -> int:
                     summary[label]["events"][
                         f"v3_{names[kind]}_{direction}_value_{value}"
                     ] += 1
+            if match := BEACON_TX_RE.search(line):
+                summary[label]["events"]["beacon_tx"] += 1
+                summary[label]["events"][
+                    f"beacon_tx_repeat_{match.group(2)}"
+                ] += 1
+            if match := BEACON_RX_RE.search(line):
+                summary[label]["events"]["beacon_rx"] += 1
+                if int(match.group(2)) == 4:
+                    summary[label]["events"]["beacon_stale"] += 1
             if "trunk transfer COMPLETE" in line:
                 summary[label]["events"]["transfer_complete"] += 1
             if "TX watchdog expired" in line:

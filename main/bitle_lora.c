@@ -16,6 +16,7 @@
 #include "bitle_mesh.h"
 #include "bitle_stats.h"
 #include "lora_airtime.h"
+#include "lora_channel_policy.h"
 #include "lora_packet_reliability.h"
 #include "lora_region.h"
 #include "lora_trunk_protocol.h"
@@ -109,12 +110,7 @@ static const char *TAG = "bitle_lora";
 #define TRUNK_MAX_FRAGS  ((BITCHAT_BLE_MAX_PACKET_SIZE + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX)
 
 /* Channel access: CAD (listen-before-talk) + random backoff before TX. */
-#define CAD_RETRIES      5
-#define CAD_BACKOFF_MIN  30
-#define CAD_BACKOFF_SPAN 120
-#define ACK_BURST_MAX    4
-#define RELIABILITY_CONTENTION_MS \
-    (1200U + CAD_RETRIES * (CAD_BACKOFF_MIN + CAD_BACKOFF_SPAN))
+#define CAD_RETRIES 5
 
 typedef struct {
     uint16_t len;
@@ -135,6 +131,9 @@ static uint32_t s_transfer_counter;
 typedef struct {
     bool valid;
     bool ack_requested;
+    bool announcement;
+    bool relayed_broadcast;
+    uint8_t announce_sender[8];
     uint8_t destination[LORA_TRUNK_V3_NODE_ID_LEN];
     uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN];
 } tx_trunk_context_t;
@@ -154,6 +153,7 @@ static uint8_t s_sf;
 static uint32_t s_bw;
 static uint8_t s_cr;             /* denominator 5..8 => 4/5..4/8 */
 static uint16_t s_preamble_symbols;
+static lora_region_id_t s_region;
 static bool s_ota_over_trunk;    /* OTA image chunks on the trunk (default off) */
 static bitle_lora_diag_t s_diag;
 
@@ -164,6 +164,7 @@ static uint64_t s_gov_last_ms;
 
 typedef struct {
     bool in_use;
+    bool pending;
     uint8_t tag[8];
     uint64_t last_ms;
 } throttle_t;
@@ -186,12 +187,19 @@ static uint32_t trunk_airtime_ms(uint16_t payload_len)
 static bool trunk_reliability_timing(
     uint8_t fragment_total, lora_reliability_timing_t *out)
 {
+    uint32_t maximum_airtime =
+        trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN + TRUNK_CHUNK_TX);
+    lora_contention_window_t contention;
+    if (!lora_contention_window(
+            maximum_airtime, CAD_RETRIES, false, &contention)) {
+        return false;
+    }
     return lora_reliability_timing(
-        trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN + TRUNK_CHUNK_TX),
+        maximum_airtime,
         trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN),
         fragment_total,
         LORA_SELECTIVE_REPEAT_ROUNDS,
-        RELIABILITY_CONTENTION_MS,
+        contention.maximum_ms,
         out);
 }
 
@@ -217,9 +225,10 @@ static void diag_sync_scheduler_locked(void)
     }
 }
 
-/* Per-origin announce throttle (call inside the governor critical section).
- * Returns true if this sender's announce should be dropped now. */
-static bool announce_throttled(const uint8_t *sender, uint64_t now)
+/* Per-origin announce throttle. Admission marks one pending copy; only a
+ * fully transmitted packet advances last_ms. Caller holds s_gov_mux. */
+static throttle_t *announce_slot_locked(
+    const uint8_t *sender, bool create)
 {
     throttle_t *slot = NULL, *free_slot = NULL, *oldest = &s_throttle[0];
     for (size_t i = 0; i < THROTTLE_SLOTS; ++i) {
@@ -233,22 +242,90 @@ static bool announce_throttled(const uint8_t *sender, uint64_t now)
             oldest = t;
         }
     }
-    if (slot) {
-        if (now - slot->last_ms < ANNOUNCE_MIN_INTERVAL_MS) {
-            return true;
-        }
-        slot->last_ms = now;
-        return false;
+    if (!slot && create) {
+        slot = free_slot ? free_slot : oldest;
+        memset(slot, 0, sizeof(*slot));
+        slot->in_use = true;
+        memcpy(slot->tag, sender, sizeof(slot->tag));
     }
-    slot = free_slot ? free_slot : oldest;
-    slot->in_use = true;
-    memcpy(slot->tag, sender, 8);
-    slot->last_ms = now;
-    return false;
+    return slot;
+}
+
+static bool announce_allowed_locked(const uint8_t *sender, uint64_t now)
+{
+    throttle_t *slot = announce_slot_locked(sender, false);
+    return !slot ||
+           (!slot->pending &&
+            (slot->last_ms == 0 || now < slot->last_ms ||
+             now - slot->last_ms >= ANNOUNCE_MIN_INTERVAL_MS));
+}
+
+static void announce_mark_pending_locked(const uint8_t *sender)
+{
+    throttle_t *slot = announce_slot_locked(sender, true);
+    if (slot) {
+        slot->pending = true;
+    }
+}
+
+static void announce_finish_locked(
+    const uint8_t *sender, bool transmitted, uint64_t now)
+{
+    throttle_t *slot = announce_slot_locked(sender, false);
+    if (!slot) {
+        return;
+    }
+    slot->pending = false;
+    if (transmitted) {
+        slot->last_ms = now;
+        s_diag.announce_tx++;
+    } else if (slot->last_ms == 0) {
+        memset(slot, 0, sizeof(*slot));
+    }
 }
 
 /* Admission + governor for one whole encoded packet. Caller holds s_gov_mux,
  * which couples the policy state change to the scheduler admission. */
+static void governor_refill_locked(uint64_t now)
+{
+    if (now < s_gov_last_ms) {
+        s_gov_last_ms = now;
+        return;
+    }
+    s_gov_credit_ms += (double)(now - s_gov_last_ms) * s_gov_refill_frac;
+    if (s_gov_credit_ms > GOV_BURST_MS) {
+        s_gov_credit_ms = GOV_BURST_MS;
+    }
+    s_gov_last_ms = now;
+}
+
+static bool governor_debit_locked(uint32_t airtime, bool governed)
+{
+    uint64_t now = esp_timer_get_time() / 1000ULL;
+    governor_refill_locked(now);
+    if (governed && s_gov_credit_ms < (double)airtime) {
+        return false;
+    }
+    s_gov_credit_ms -= airtime;
+    if (s_gov_credit_ms < -GOV_BURST_MS) {
+        s_gov_credit_ms = -GOV_BURST_MS;
+    }
+    return true;
+}
+
+static bool beacon_budget_admit(uint16_t encoded_len)
+{
+    bool admitted;
+    taskENTER_CRITICAL(&s_gov_mux);
+    admitted = governor_debit_locked(
+        trunk_airtime_ms(encoded_len), true);
+    if (!admitted) {
+        s_diag.beacon_budget_deferred++;
+    }
+    taskEXIT_CRITICAL(&s_gov_mux);
+    return admitted;
+}
+
 static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
 {
     if (len < PKT_MIN_LEN) {
@@ -285,15 +362,8 @@ static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
         airtime += trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN + chunk);
     }
 
-    /* Reading the clock under the lock prevents another producer from
-     * advancing s_gov_last_ms past this sample. */
     uint64_t now = esp_timer_get_time() / 1000ULL;
-    /* Refill the shared airtime credit. */
-    s_gov_credit_ms += (double)(now - s_gov_last_ms) * s_gov_refill_frac;
-    if (s_gov_credit_ms > GOV_BURST_MS) {
-        s_gov_credit_ms = GOV_BURST_MS;
-    }
-    s_gov_last_ms = now;
+    governor_refill_locked(now);
     /* Governed (announce) traffic yields when the budget is exhausted; it is
      * periodic and will re-announce. Message traffic always passes but still
      * debits, so a busy DM session naturally suppresses announces until the
@@ -305,15 +375,11 @@ static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
             ESP_LOGD(TAG, "airtime budget low; deferring announce");
             return false;
         }
-        if (announce_throttled(data + PKT_SENDER_OFF, now)) {
+        if (!announce_allowed_locked(data + PKT_SENDER_OFF, now)) {
             return false;
         }
     }
-    s_gov_credit_ms -= airtime;
-    if (s_gov_credit_ms < -GOV_BURST_MS) {
-        s_gov_credit_ms = -GOV_BURST_MS;
-    }
-    return true;
+    return governor_debit_locked(airtime, false);
 }
 
 /* Reassembly stays statically bounded. Progress and absolute deadlines are
@@ -496,6 +562,9 @@ static bitle_link_send_result_t lora_link_commit(
     uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN] = {0};
     uint8_t destination[LORA_TRUNK_V3_NODE_ID_LEN] = {0};
     bool ack_requested = false;
+    bool announcement =
+        type == BITCHAT_MSG_ANNOUNCE ||
+        type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE;
     bool committed = false;
 
     taskENTER_CRITICAL(&s_gov_mux);
@@ -547,6 +616,20 @@ static bitle_link_send_result_t lora_link_commit(
         tx_trunk_context_t *context = &s_tx_context[reserved];
         context->valid = true;
         context->ack_requested = ack_requested;
+        context->announcement = announcement;
+        context->relayed_broadcast =
+            !ack_requested &&
+            memcmp(
+                data + PKT_SENDER_OFF, s_node_id,
+                sizeof(s_node_id)) != 0;
+        if (announcement) {
+            memcpy(
+                context->announce_sender,
+                data + PKT_SENDER_OFF,
+                sizeof(context->announce_sender));
+            announce_mark_pending_locked(
+                context->announce_sender);
+        }
         memcpy(context->destination, destination, sizeof(destination));
         memcpy(context->transfer_id, transfer_id, sizeof(transfer_id));
         s_transfer_counter = transfer_counter;
@@ -601,12 +684,19 @@ static bool tx_scheduler_dequeue(lora_tx_handle_t *out_handle)
     return dequeued;
 }
 
-static void tx_scheduler_release(lora_tx_handle_t handle)
+static void tx_scheduler_release(
+    lora_tx_handle_t handle, bool transmitted)
 {
     if (handle == LORA_TX_HANDLE_INVALID) {
         return;
     }
     taskENTER_CRITICAL(&s_gov_mux);
+    tx_trunk_context_t context = s_tx_context[handle];
+    if (context.announcement) {
+        announce_finish_locked(
+            context.announce_sender, transmitted,
+            esp_timer_get_time() / 1000ULL);
+    }
     memset(&s_tx_context[handle], 0, sizeof(s_tx_context[handle]));
     lora_tx_scheduler_release(&s_tx_scheduler, handle);
     diag_sync_scheduler_locked();
@@ -1153,6 +1243,35 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
     ESP_LOGI(TAG, "trunk v%u raw RX len=%u rssi=%d snr=%d kind=%u",
              frame.version, len, rssi, snr, frame.kind);
 
+    if (frame.kind == LORA_TRUNK_KIND_BEACON) {
+        uint8_t region = 0;
+        uint32_t freshness = 0;
+        if (!lora_trunk_beacon_fields(
+                &frame, &region, &freshness) ||
+            region != (uint8_t)s_region) {
+            return;
+        }
+        lora_trunk_neighbor_result_t result;
+        taskENTER_CRITICAL(&s_gov_mux);
+        result = lora_trunk_neighbor_learn_beacon(
+            &s_neighbors, frame.source, frame.transfer_id,
+            freshness, region, frame.capabilities,
+            esp_timer_get_time() / 1000ULL);
+        s_diag.beacon_rx++;
+        if (result == LORA_TRUNK_NEIGHBOR_STALE) {
+            s_diag.beacon_stale++;
+        } else if (result == LORA_TRUNK_NEIGHBOR_COLLISION) {
+            s_diag.neighbor_collisions++;
+        }
+        s_diag.neighbor_count =
+            (uint32_t)lora_trunk_neighbor_count(&s_neighbors);
+        taskEXIT_CRITICAL(&s_gov_mux);
+        ESP_LOGI(
+            TAG, "trunk beacon RX freshness=%lu result=%u",
+            (unsigned long)freshness, result);
+        return;
+    }
+
     if (frame.kind != LORA_TRUNK_KIND_DATA) {
         /* Shared-channel controls for other senders are normal. A control
          * addressed to us must match the selected peer and the complete
@@ -1207,16 +1326,110 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
     reassemble_data(&frame, addressed_to_us, rssi, snr);
 }
 
-/* Neighbor discovery: our signed announce over the trunk, so two nodes
- * with no phone in sight still find and verify each other. */
+/* Minimum viable radio-neighbor discovery is intentionally separate from the
+ * signed BitChat/Noise identity announce. A compact beacon is repeated without
+ * ACKs; the signed application announce follows its own randomized cadence. */
 #define BEACON_FIRST_MS    5000ULL
 #define BEACON_INTERVAL_MS 60000ULL
 #define BEACON_START_JITTER_MS 10000U
 #define BEACON_INTERVAL_JITTER_MS 30000U
+#define BEACON_REPEAT_MIN_MS 1000U
+#define BEACON_REPEAT_SPAN_MS 4000U
+
+typedef struct {
+    uint32_t freshness;
+    uint8_t remaining;
+    uint64_t next_burst_ms;
+    uint64_t next_repeat_ms;
+} beacon_schedule_t;
+
+static void beacon_schedule_begin(
+    beacon_schedule_t *schedule, uint64_t now)
+{
+    schedule->next_burst_ms =
+        now + BEACON_INTERVAL_MS -
+        (BEACON_INTERVAL_JITTER_MS / 2U) +
+        (esp_random() % BEACON_INTERVAL_JITTER_MS);
+    if (schedule->remaining != 0) {
+        return;
+    }
+    schedule->freshness++;
+    if (schedule->freshness == 0) {
+        schedule->freshness = 1;
+    }
+    schedule->remaining = LORA_CHANNEL_BEACON_REPETITIONS;
+    schedule->next_repeat_ms =
+        now + (esp_random() % BEACON_START_JITTER_MS);
+}
+
+static void beacon_schedule_finish_attempt(
+    beacon_schedule_t *schedule, bool *have_pending,
+    bool *pending_is_beacon, uint64_t now)
+{
+    if (schedule->remaining > 0) {
+        schedule->remaining--;
+    }
+    schedule->next_repeat_ms =
+        schedule->remaining == 0
+            ? UINT64_MAX
+            : now + BEACON_REPEAT_MIN_MS +
+                  (esp_random() % BEACON_REPEAT_SPAN_MS);
+    *have_pending = false;
+    *pending_is_beacon = false;
+}
+
+static bool build_beacon_frame(
+    uint32_t freshness, lora_frame_t *frame)
+{
+    lora_trunk_frame_t beacon;
+    if (!lora_trunk_beacon_init(
+            &beacon, s_node_id, s_boot_epoch, freshness,
+            (uint8_t)s_region, LORA_TRUNK_V3_CAP_PROTOCOL)) {
+        return false;
+    }
+    size_t encoded_len = 0;
+    if (!lora_trunk_v3_encode(
+            &beacon, frame->data, sizeof(frame->data),
+            &encoded_len)) {
+        return false;
+    }
+    frame->len = (uint16_t)encoded_len;
+    frame->want_ack = false;
+    return encoded_len == LORA_TRUNK_V3_HEADER_LEN;
+}
+
+static bool schedule_contention_backoff(
+    const lora_frame_t *frame, uint8_t busy_attempt,
+    bool relayed_broadcast, uint64_t *deadline)
+{
+    lora_contention_window_t window;
+    if (!frame || !deadline ||
+        !lora_contention_window(
+            trunk_airtime_ms(frame->len), busy_attempt,
+            relayed_broadcast, &window)) {
+        return false;
+    }
+    if (!resume_rx_or_recover("contention backoff resume RX")) {
+        return false;
+    }
+    *deadline =
+        esp_timer_get_time() / 1000ULL +
+        lora_contention_delay(&window, esp_random());
+    diag_inc(&s_diag.channel_backoffs);
+    return true;
+}
 
 static void drop_tx_packet(lora_tx_handle_t *handle, bool *have_pending)
 {
-    tx_scheduler_release(*handle);
+    tx_scheduler_release(*handle, false);
+    *handle = LORA_TX_HANDLE_INVALID;
+    *have_pending = false;
+}
+
+static void complete_tx_packet(
+    lora_tx_handle_t *handle, bool *have_pending)
+{
+    tx_scheduler_release(*handle, true);
     *handle = LORA_TX_HANDLE_INVALID;
     *have_pending = false;
 }
@@ -1248,14 +1461,14 @@ static bool advance_tx_packet(lora_tx_handle_t *handle, uint8_t *fragment_idx,
 {
     (*fragment_idx)++;
     if (*fragment_idx >= fragment_total) {
-        tx_scheduler_release(*handle);
+        tx_scheduler_release(*handle, true);
         *handle = LORA_TX_HANDLE_INVALID;
         return false;
     }
     uint8_t checked_total = 0;
     if (!build_tx_fragment(*handle, *fragment_idx, frame, &checked_total) ||
         checked_total != fragment_total) {
-        tx_scheduler_release(*handle);
+        tx_scheduler_release(*handle, false);
         *handle = LORA_TX_HANDLE_INVALID;
         return false;
     }
@@ -1292,14 +1505,25 @@ static void lora_task(void *arg)
     bool awaiting_tx_done = false;
     bool tx_is_ack = false;
     bool awaiting_cad = false;
+    bool awaiting_backoff = false;
     bool awaiting_ack = false;
+    bool pending_is_beacon = false;
+    bool pending_relayed_broadcast = false;
     unsigned ack_burst = 0;
     uint64_t tx_watchdog_deadline = 0;
+    uint64_t backoff_deadline = 0;
     uint64_t ack_deadline = 0;
     uint64_t transfer_deadline = 0;
     lora_reliability_timing_t transfer_timing = {0};
-    uint64_t next_beacon_ms =
-        BEACON_FIRST_MS + (esp_random() % BEACON_START_JITTER_MS);
+    beacon_schedule_t beacon_schedule = {
+        .next_burst_ms =
+            BEACON_FIRST_MS +
+            (esp_random() % BEACON_START_JITTER_MS),
+        .next_repeat_ms = UINT64_MAX,
+    };
+    uint64_t next_identity_announce_ms =
+        BEACON_FIRST_MS +
+        (esp_random() % BEACON_START_JITTER_MS);
     uint64_t next_diag_ms = 60000ULL;
 #if CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE
     static const uint16_t smoke_lengths[] = {100, 180, 300, 420, 520};
@@ -1315,13 +1539,16 @@ static void lora_task(void *arg)
 
         uint64_t now = esp_timer_get_time() / 1000ULL;
         expire_reassembly(now);
-        if (now >= next_beacon_ms) {
-            next_beacon_ms =
+        if (now >= beacon_schedule.next_burst_ms) {
+            beacon_schedule_begin(&beacon_schedule, now);
+        }
+        if (now >= next_identity_announce_ms) {
+            next_identity_announce_ms =
                 now + BEACON_INTERVAL_MS -
                 (BEACON_INTERVAL_JITTER_MS / 2U) +
                 (esp_random() % BEACON_INTERVAL_JITTER_MS);
             if (noise_announce_link(BITLE_LORA_LINK_HANDLE)) {
-                ESP_LOGI(TAG, "trunk beacon sent");
+                ESP_LOGI(TAG, "signed identity announce admitted");
             }
         }
 
@@ -1337,7 +1564,8 @@ static void lora_task(void *arg)
             for (size_t i = 0; i < LORA_TRUNK_NEIGHBOR_CAPACITY; ++i) {
                 const lora_trunk_neighbor_t *entry =
                     &s_neighbors.entries[i];
-                if (entry->in_use && !entry->quarantined &&
+                if (entry->in_use && entry->identity_authenticated &&
+                    !entry->quarantined &&
                     now >= entry->last_seen_ms &&
                     now - entry->last_seen_ms <= 180000ULL &&
                     (!freshest ||
@@ -1403,7 +1631,8 @@ static void lora_task(void *arg)
                      "policy=%lu release=%lu cancel=%lu malformed=%lu "
                      "unsupported=%lu ack_reject=%lu neighbors=%lu collision=%lu "
                      "bitmap=%lu final=%lu dup=%lu/%lu abort=%lu/%lu "
-                     "invalid=%lu resource=%lu",
+                     "invalid=%lu resource=%lu beacon=%lu/%lu stale=%lu "
+                     "budget=%lu backoff=%lu announce_tx=%lu",
                      (unsigned long)diag.raw_rx_frames,
                      (unsigned long)diag.crc_errors,
                      (unsigned long)diag.tx_attempts,
@@ -1447,7 +1676,13 @@ static void lora_task(void *arg)
                      (unsigned long)diag.transfer_aborts_tx,
                      (unsigned long)diag.transfer_aborts_rx,
                      (unsigned long)diag.invalid_reassemblies,
-                     (unsigned long)diag.resource_aborts);
+                     (unsigned long)diag.resource_aborts,
+                     (unsigned long)diag.beacon_tx,
+                     (unsigned long)diag.beacon_rx,
+                     (unsigned long)diag.beacon_stale,
+                     (unsigned long)diag.beacon_budget_deferred,
+                     (unsigned long)diag.channel_backoffs,
+                     (unsigned long)diag.announce_tx);
             next_diag_ms = now + 60000ULL;
         }
 
@@ -1477,9 +1712,16 @@ static void lora_task(void *arg)
                 if (!resume_rx_or_recover("TX_DONE resume RX")) {
                     tx_is_ack = false;
                     if (have_pending) {
-                        abort_tx_packet(
-                            &packet_handle, &have_pending,
-                            LORA_TRUNK_ABORT_RADIO_RESET);
+                        if (pending_is_beacon) {
+                            beacon_schedule_finish_attempt(
+                                &beacon_schedule, &have_pending,
+                                &pending_is_beacon,
+                                esp_timer_get_time() / 1000ULL);
+                        } else {
+                            abort_tx_packet(
+                                &packet_handle, &have_pending,
+                                LORA_TRUNK_ABORT_RADIO_RESET);
+                        }
                     }
                     break;
                 }
@@ -1490,6 +1732,20 @@ static void lora_task(void *arg)
                         ack_deadline +=
                             trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN) + 300;
                     }
+                } else if (pending_is_beacon) {
+                    diag_inc(&s_diag.beacon_tx);
+                    ESP_LOGI(
+                        TAG,
+                        "trunk beacon TX freshness=%lu repeat=%u",
+                        (unsigned long)beacon_schedule.freshness,
+                        (unsigned)(
+                            LORA_CHANNEL_BEACON_REPETITIONS -
+                            beacon_schedule.remaining + 1u));
+                    beacon_schedule_finish_attempt(
+                        &beacon_schedule, &have_pending,
+                        &pending_is_beacon,
+                        esp_timer_get_time() / 1000ULL);
+                    cad_tries = 0;
                 } else if (have_pending && pending.want_ack) {
                     if (prepare_selective_fragment(
                             packet_handle, &pending, fragment_total,
@@ -1512,7 +1768,7 @@ static void lora_task(void *arg)
                 awaiting_cad = false;
                 if (s_ack_count > 0 &&
                     (!(have_pending || tx_scheduler_has_queued()) ||
-                     ack_burst < ACK_BURST_MAX)) {
+                     ack_burst < LORA_CHANNEL_ACK_BURST_MAX)) {
                     /* ACKs preempt boundedly; after four, queued packet
                      * traffic gets one transmission opportunity. */
                     if (transmit_ack_now()) {
@@ -1548,46 +1804,63 @@ static void lora_task(void *arg)
                             sx1262_tx_watchdog_ms(pending.len);
                         ack_burst = 0;
                     } else {
-                        abort_tx_packet(
-                            &packet_handle, &have_pending,
-                            LORA_TRUNK_ABORT_RADIO_RESET);
+                        if (pending_is_beacon) {
+                            beacon_schedule_finish_attempt(
+                                &beacon_schedule, &have_pending,
+                                &pending_is_beacon,
+                                esp_timer_get_time() / 1000ULL);
+                        } else {
+                            abort_tx_packet(
+                                &packet_handle, &have_pending,
+                                LORA_TRUNK_ABORT_RADIO_RESET);
+                        }
                         recover_radio("data transmit command");
                     }
                 }
                 break;
             case SX1262_EVT_CAD_BUSY:
                 awaiting_cad = false;
+                if (have_pending && cad_tries < UINT8_MAX) {
+                    cad_tries++;
+                }
                 if (have_pending &&
-                    (pending.want_ack || ++cad_tries <= CAD_RETRIES)) {
+                    (pending.want_ack || cad_tries <= CAD_RETRIES)) {
                     /* An addressed transfer owns a bounded absolute deadline;
                      * temporary channel occupancy must not discard it after a
                      * small fixed number of CAD results. Return to RX during
                      * backoff so packet feedback remains observable, then
                      * retry until COMPLETE, ABORT, or the transfer deadline. */
-                    if (!resume_rx_or_recover(
-                            "CAD busy backoff resume RX")) {
-                        abort_tx_packet(
-                            &packet_handle, &have_pending,
-                            LORA_TRUNK_ABORT_RADIO_RESET);
-                        break;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(CAD_BACKOFF_MIN +
-                                             (esp_random() % CAD_BACKOFF_SPAN)));
-                    if (sx1262_start_cad() == ESP_OK) {
-                        awaiting_cad = true;
+                    if (schedule_contention_backoff(
+                            &pending, (uint8_t)cad_tries,
+                            pending_relayed_broadcast,
+                            &backoff_deadline)) {
+                        awaiting_backoff = true;
                     } else {
-                        abort_tx_packet(
-                            &packet_handle, &have_pending,
-                            LORA_TRUNK_ABORT_RADIO_RESET);
-                        recover_radio("CAD retry command");
+                        if (pending_is_beacon) {
+                            beacon_schedule_finish_attempt(
+                                &beacon_schedule, &have_pending,
+                                &pending_is_beacon,
+                                esp_timer_get_time() / 1000ULL);
+                        } else {
+                            abort_tx_packet(
+                                &packet_handle, &have_pending,
+                                LORA_TRUNK_ABORT_RADIO_RESET);
+                        }
                     }
                 } else {
                     /* Channel persistently busy: reject the complete packet;
                      * sending only its earlier fragments cannot complete. */
                     if (have_pending) {
-                        abort_tx_packet(
-                            &packet_handle, &have_pending,
-                            LORA_TRUNK_ABORT_RESOURCE_PRESSURE);
+                        if (pending_is_beacon) {
+                            beacon_schedule_finish_attempt(
+                                &beacon_schedule, &have_pending,
+                                &pending_is_beacon,
+                                esp_timer_get_time() / 1000ULL);
+                        } else {
+                            abort_tx_packet(
+                                &packet_handle, &have_pending,
+                                LORA_TRUNK_ABORT_RESOURCE_PRESSURE);
+                        }
                     }
                     resume_rx_or_recover("CAD busy resume RX");
                 }
@@ -1601,11 +1874,19 @@ static void lora_task(void *arg)
                 tx_watchdog_deadline = 0;
                 tx_is_ack = false;
                 awaiting_ack = false;
+                awaiting_backoff = false;
                 if (!resume_rx_or_recover("radio TX timeout")) {
                     if (have_pending) {
-                        abort_tx_packet(
-                            &packet_handle, &have_pending,
-                            LORA_TRUNK_ABORT_RADIO_RESET);
+                        if (pending_is_beacon) {
+                            beacon_schedule_finish_attempt(
+                                &beacon_schedule, &have_pending,
+                                &pending_is_beacon,
+                                esp_timer_get_time() / 1000ULL);
+                        } else {
+                            abort_tx_packet(
+                                &packet_handle, &have_pending,
+                                LORA_TRUNK_ABORT_RADIO_RESET);
+                        }
                     }
                 } else if (timed_out_ack && data_was_waiting) {
                     awaiting_ack = true;
@@ -1621,6 +1902,11 @@ static void lora_task(void *arg)
                             esp_timer_get_time() / 1000ULL +
                             transfer_timing.feedback_wait_ms;
                     }
+                } else if (!timed_out_ack && pending_is_beacon) {
+                    beacon_schedule_finish_attempt(
+                        &beacon_schedule, &have_pending,
+                        &pending_is_beacon,
+                        esp_timer_get_time() / 1000ULL);
                 } else if (!timed_out_ack && have_pending) {
                     drop_tx_packet(&packet_handle, &have_pending);
                 }
@@ -1635,13 +1921,21 @@ static void lora_task(void *arg)
             case SX1262_EVT_ERROR:
                 awaiting_tx_done = false;
                 awaiting_cad = false;
+                awaiting_backoff = false;
                 awaiting_ack = false;
                 tx_is_ack = false;
                 tx_watchdog_deadline = 0;
                 if (have_pending) {
-                    abort_tx_packet(
-                        &packet_handle, &have_pending,
-                        LORA_TRUNK_ABORT_RADIO_RESET);
+                    if (pending_is_beacon) {
+                        beacon_schedule_finish_attempt(
+                            &beacon_schedule, &have_pending,
+                            &pending_is_beacon,
+                            esp_timer_get_time() / 1000ULL);
+                    } else {
+                        abort_tx_packet(
+                            &packet_handle, &have_pending,
+                            LORA_TRUNK_ABORT_RADIO_RESET);
+                    }
                 }
                 recover_radio("IRQ status command");
                 break;
@@ -1654,7 +1948,8 @@ static void lora_task(void *arg)
          * peer is listening right after its TX and is waiting on us. */
         bool data_waiting = have_pending || tx_scheduler_has_queued();
         if (s_ack_count > 0 && !awaiting_tx_done && !awaiting_cad &&
-            (!data_waiting || ack_burst < ACK_BURST_MAX)) {
+            (!data_waiting ||
+             ack_burst < LORA_CHANNEL_ACK_BURST_MAX)) {
             if (transmit_ack_now()) {
                 ack_burst++;
                 awaiting_tx_done = true;
@@ -1674,13 +1969,20 @@ static void lora_task(void *arg)
             ESP_LOGW(TAG, "TX watchdog expired; resetting radio");
             awaiting_tx_done = false;
             awaiting_cad = false;
+            awaiting_backoff = false;
             awaiting_ack = false;
             tx_is_ack = false;
             tx_watchdog_deadline = 0;
             if (have_pending) {
-                abort_tx_packet(
-                    &packet_handle, &have_pending,
-                    LORA_TRUNK_ABORT_RADIO_RESET);
+                if (pending_is_beacon) {
+                    beacon_schedule_finish_attempt(
+                        &beacon_schedule, &have_pending,
+                        &pending_is_beacon, watchdog_now);
+                } else {
+                    abort_tx_packet(
+                        &packet_handle, &have_pending,
+                        LORA_TRUNK_ABORT_RADIO_RESET);
+                }
             }
             recover_radio("software TX watchdog");
         }
@@ -1698,8 +2000,13 @@ static void lora_task(void *arg)
             }
             awaiting_ack = false;
             awaiting_cad = false;
+            awaiting_backoff = false;
             s_feedback_seen = false;
-            drop_tx_packet(&packet_handle, &have_pending);
+            if (s_selective_tx.complete) {
+                complete_tx_packet(&packet_handle, &have_pending);
+            } else {
+                drop_tx_packet(&packet_handle, &have_pending);
+            }
         } else if (awaiting_ack && have_pending) {
             uint64_t now2 = esp_timer_get_time() / 1000ULL;
             if (now2 >= ack_deadline) {
@@ -1731,60 +2038,110 @@ static void lora_task(void *arg)
             diag_inc(&s_diag.retry_exhaustion);
             awaiting_ack = false;
             awaiting_cad = false;
+            awaiting_backoff = false;
             abort_tx_packet(
                 &packet_handle, &have_pending,
                 LORA_TRUNK_ABORT_RETRY_EXHAUSTED);
         }
 
-        /* Re-arm a pending data frame that was stranded idle in every wait
-         * state — happens when an ack preempted its CAD result (CAD_CLEAR
-         * with s_ack_count>0), or when an ack transmit returned an error.
-         * Without this the frame sits forever with have_pending=true, which
-         * also blocks the dequeue below and half-deadlocks outbound TX. */
-        if (have_pending && !awaiting_cad && !awaiting_tx_done && !awaiting_ack) {
+        /* Backoff is a task deadline, not a blocking delay: the radio remains
+         * in continuous RX and controls may preempt while the deadline runs.
+         * CAD is rechecked immediately before every actual transmission. */
+        uint64_t channel_now = esp_timer_get_time() / 1000ULL;
+        if (awaiting_backoff && channel_now >= backoff_deadline &&
+            !awaiting_tx_done && !awaiting_cad && !awaiting_ack) {
+            awaiting_backoff = false;
             if (sx1262_start_cad() == ESP_OK) {
                 awaiting_cad = true;
             } else {
-                abort_tx_packet(
-                    &packet_handle, &have_pending,
-                    LORA_TRUNK_ABORT_RADIO_RESET);
-                recover_radio("pending CAD command");
+                if (pending_is_beacon) {
+                    beacon_schedule_finish_attempt(
+                        &beacon_schedule, &have_pending,
+                        &pending_is_beacon, channel_now);
+                } else if (have_pending) {
+                    abort_tx_packet(
+                        &packet_handle, &have_pending,
+                        LORA_TRUNK_ABORT_RADIO_RESET);
+                }
+                recover_radio("post-backoff CAD command");
             }
         }
 
-        if (!have_pending && !awaiting_tx_done && !awaiting_cad && !awaiting_ack &&
-            tx_scheduler_dequeue(&packet_handle)) {
-            fragment_idx = 0;
-            have_pending = build_tx_fragment(
-                packet_handle, fragment_idx, &pending, &fragment_total);
-            if (!have_pending) {
-                drop_tx_packet(&packet_handle, &have_pending);
-                continue;
+        if (!have_pending && !awaiting_tx_done && !awaiting_cad &&
+            !awaiting_backoff && !awaiting_ack) {
+            if (beacon_schedule.remaining > 0 &&
+                channel_now >= beacon_schedule.next_repeat_ms) {
+                if (build_beacon_frame(
+                        beacon_schedule.freshness, &pending) &&
+                    beacon_budget_admit(pending.len)) {
+                    packet_handle = LORA_TX_HANDLE_INVALID;
+                    fragment_idx = 0;
+                    fragment_total = 1;
+                    have_pending = true;
+                    pending_is_beacon = true;
+                    pending_relayed_broadcast = false;
+                    s_expected_control_valid = false;
+                } else {
+                    beacon_schedule.next_repeat_ms =
+                        channel_now + BEACON_REPEAT_MIN_MS +
+                        (esp_random() % BEACON_REPEAT_SPAN_MS);
+                }
             }
-            if (pending.want_ack &&
-                (!lora_selective_tx_init(
-                     &s_selective_tx, fragment_total) ||
-                 !trunk_reliability_timing(
-                     fragment_total, &transfer_timing))) {
-                abort_tx_packet(
-                    &packet_handle, &have_pending,
-                    LORA_TRUNK_ABORT_INVALID_LENGTH);
-                continue;
+
+            if (!have_pending &&
+                tx_scheduler_dequeue(&packet_handle)) {
+                fragment_idx = 0;
+                pending_is_beacon = false;
+                pending_relayed_broadcast =
+                    s_tx_context[packet_handle].relayed_broadcast;
+                have_pending = build_tx_fragment(
+                    packet_handle, fragment_idx, &pending,
+                    &fragment_total);
+                if (!have_pending) {
+                    drop_tx_packet(
+                        &packet_handle, &have_pending);
+                    continue;
+                }
+                if (pending.want_ack &&
+                    (!lora_selective_tx_init(
+                         &s_selective_tx, fragment_total) ||
+                     !trunk_reliability_timing(
+                         fragment_total, &transfer_timing))) {
+                    abort_tx_packet(
+                        &packet_handle, &have_pending,
+                        LORA_TRUNK_ABORT_INVALID_LENGTH);
+                    continue;
+                }
+                cad_tries = 0;
+                s_feedback_seen = false;
+                transfer_deadline =
+                    pending.want_ack
+                        ? channel_now +
+                              transfer_timing.absolute_timeout_ms
+                        : 0;
             }
+        }
+
+        /* A newly selected fragment, a selective-repeat round, or a frame
+         * whose CAD was preempted by control traffic all enter a fresh
+         * airtime-scaled contention window. */
+        if (have_pending && !awaiting_tx_done && !awaiting_cad &&
+            !awaiting_backoff && !awaiting_ack) {
             cad_tries = 0;
-            s_feedback_seen = false;
-            transfer_deadline =
-                pending.want_ack
-                    ? esp_timer_get_time() / 1000ULL +
-                          transfer_timing.absolute_timeout_ms
-                    : 0;
-            if (sx1262_start_cad() == ESP_OK) {
-                awaiting_cad = true;
+            if (schedule_contention_backoff(
+                    &pending, 0, pending_relayed_broadcast,
+                    &backoff_deadline)) {
+                awaiting_backoff = true;
             } else {
-                abort_tx_packet(
-                    &packet_handle, &have_pending,
-                    LORA_TRUNK_ABORT_RADIO_RESET);
-                recover_radio("dequeue CAD command");
+                if (pending_is_beacon) {
+                    beacon_schedule_finish_attempt(
+                        &beacon_schedule, &have_pending,
+                        &pending_is_beacon, channel_now);
+                } else {
+                    abort_tx_packet(
+                        &packet_handle, &have_pending,
+                        LORA_TRUNK_ABORT_RADIO_RESET);
+                }
             }
         }
     }
@@ -1824,6 +2181,7 @@ void bitle_lora_shutdown(void)
     taskENTER_CRITICAL(&s_gov_mux);
     lora_tx_scheduler_cancel_all(&s_tx_scheduler);
     memset(s_tx_context, 0, sizeof(s_tx_context));
+    memset(s_throttle, 0, sizeof(s_throttle));
     diag_sync_scheduler_locked();
     taskEXIT_CRITICAL(&s_gov_mux);
     memset(s_rx_slots, 0, sizeof(s_rx_slots));
@@ -1957,6 +2315,7 @@ esp_err_t bitle_lora_init(void)
     }
     s_transfer_counter = 0;
     memset(s_tx_context, 0, sizeof(s_tx_context));
+    memset(s_throttle, 0, sizeof(s_throttle));
     memset(s_rx_slots, 0, sizeof(s_rx_slots));
     memset(s_completed_slots, 0, sizeof(s_completed_slots));
     lora_trunk_neighbor_table_init(&s_neighbors);
@@ -1972,6 +2331,7 @@ esp_err_t bitle_lora_init(void)
     s_bw = cfg.bw_hz;
     s_cr = cfg.cr;
     s_preamble_symbols = cfg.preamble_symbols;
+    s_region = cfg.region;
     s_gov_refill_frac = duty_pct / 100.0;
     s_gov_credit_ms = GOV_BURST_MS;
     s_gov_last_ms = esp_timer_get_time() / 1000ULL;

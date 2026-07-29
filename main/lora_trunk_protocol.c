@@ -1,4 +1,5 @@
 #include "lora_trunk_protocol.h"
+#include "lora_channel_policy.h"
 
 #include <string.h>
 
@@ -20,6 +21,14 @@ static bool all_zero(const uint8_t *value, size_t len)
 static uint16_t read_be16(const uint8_t *p)
 {
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static uint32_t read_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
 }
 
 static void write_be16(uint8_t *p, uint16_t value)
@@ -53,8 +62,6 @@ static bool v3_semantics_valid(const lora_trunk_frame_t *frame)
         (frame->flags & ~V3_FLAG_MASK) != 0 ||
         all_zero(frame->source, sizeof(frame->source)) ||
         all_zero(frame->transfer_id, sizeof(frame->transfer_id)) ||
-        frame->fragment_total == 0 ||
-        frame->fragment_total > LORA_TRUNK_MAX_FRAGMENTS ||
         frame->payload_len > LORA_TRUNK_V3_MAX_PAYLOAD ||
         frame->hop_count > frame->hop_limit) {
         return false;
@@ -67,6 +74,10 @@ static bool v3_semantics_valid(const lora_trunk_frame_t *frame)
         (frame->flags & LORA_TRUNK_V3_FLAG_ACK_REQUESTED) != 0;
 
     if (frame->kind == LORA_TRUNK_KIND_DATA) {
+        if (frame->fragment_total == 0 ||
+            frame->fragment_total > LORA_TRUNK_MAX_FRAGMENTS) {
+            return false;
+        }
         if (frame->payload_len == 0 || !frame->payload) {
             return false;
         }
@@ -78,6 +89,20 @@ static bool v3_semantics_valid(const lora_trunk_frame_t *frame)
             return false;
         }
         return true;
+    }
+    if (frame->kind == LORA_TRUNK_KIND_BEACON) {
+        return frame->flags == LORA_TRUNK_V3_FLAG_BROADCAST &&
+               destination_zero && !ack_requested &&
+               frame->capabilities != 0 &&
+               frame->hop_limit < LORA_TRUNK_BEACON_REGION_COUNT &&
+               frame->hop_count == 0 &&
+               frame->fragment_index == 0 &&
+               frame->fragment_total == 0 &&
+               frame->payload_len == 0 && !frame->payload;
+    }
+    if (frame->fragment_total == 0 ||
+        frame->fragment_total > LORA_TRUNK_MAX_FRAGMENTS) {
+        return false;
     }
     bool control_base =
         frame->flags == 0 && frame->payload_len == 0 &&
@@ -263,11 +288,119 @@ void lora_trunk_make_transfer_id(
     out[11] = (uint8_t)counter;
 }
 
+bool lora_trunk_beacon_init(
+    lora_trunk_frame_t *frame,
+    const uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN],
+    const uint8_t boot_epoch[8], uint32_t freshness,
+    uint8_t region, uint16_t capabilities)
+{
+    if (!frame || !node_id || !boot_epoch ||
+        all_zero(boot_epoch, 8) || freshness == 0 ||
+        region >= LORA_TRUNK_BEACON_REGION_COUNT || capabilities == 0) {
+        return false;
+    }
+    memset(frame, 0, sizeof(*frame));
+    frame->version = LORA_TRUNK_V3_VERSION;
+    frame->kind = LORA_TRUNK_KIND_BEACON;
+    frame->flags = LORA_TRUNK_V3_FLAG_BROADCAST;
+    frame->capabilities = capabilities;
+    frame->hop_limit = region;
+    memcpy(frame->source, node_id, sizeof(frame->source));
+    lora_trunk_make_transfer_id(
+        boot_epoch, freshness, frame->transfer_id);
+    return v3_semantics_valid(frame);
+}
+
+bool lora_trunk_beacon_fields(
+    const lora_trunk_frame_t *frame, uint8_t *out_region,
+    uint32_t *out_freshness)
+{
+    if (!out_region || !out_freshness ||
+        !v3_semantics_valid(frame) ||
+        frame->kind != LORA_TRUNK_KIND_BEACON) {
+        return false;
+    }
+    *out_region = frame->hop_limit;
+    *out_freshness = read_be32(frame->transfer_id + 8);
+    return *out_freshness != 0;
+}
+
 void lora_trunk_neighbor_table_init(lora_trunk_neighbor_table_t *table)
 {
     if (table) {
         memset(table, 0, sizeof(*table));
     }
+}
+
+lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_beacon(
+    lora_trunk_neighbor_table_t *table,
+    const uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN],
+    const uint8_t boot_epoch[8], uint32_t freshness,
+    uint8_t region, uint16_t capabilities, uint64_t now_ms)
+{
+    if (!table || !node_id || !boot_epoch ||
+        all_zero(node_id, LORA_TRUNK_V3_NODE_ID_LEN) ||
+        all_zero(boot_epoch, 8) || freshness == 0 ||
+        region >= LORA_TRUNK_BEACON_REGION_COUNT || capabilities == 0) {
+        return LORA_TRUNK_NEIGHBOR_COLLISION;
+    }
+
+    lora_trunk_neighbor_t *same_node = NULL;
+    lora_trunk_neighbor_t *free_entry = NULL;
+    lora_trunk_neighbor_t *oldest = NULL;
+    for (size_t i = 0; i < LORA_TRUNK_NEIGHBOR_CAPACITY; ++i) {
+        lora_trunk_neighbor_t *entry = &table->entries[i];
+        if (!entry->in_use) {
+            if (!free_entry) {
+                free_entry = entry;
+            }
+            continue;
+        }
+        if (memcmp(entry->node_id, node_id,
+                   LORA_TRUNK_V3_NODE_ID_LEN) == 0) {
+            same_node = entry;
+        }
+        if (!entry->quarantined &&
+            (!oldest || entry->last_seen_ms < oldest->last_seen_ms)) {
+            oldest = entry;
+        }
+    }
+
+    if (same_node) {
+        if (same_node->quarantined) {
+            return LORA_TRUNK_NEIGHBOR_COLLISION;
+        }
+        bool same_boot =
+            memcmp(same_node->boot_epoch, boot_epoch, 8) == 0;
+        if (same_boot &&
+            !lora_freshness_newer(
+                freshness, same_node->freshness)) {
+            return LORA_TRUNK_NEIGHBOR_STALE;
+        }
+        memcpy(same_node->boot_epoch, boot_epoch, 8);
+        same_node->freshness = freshness;
+        same_node->region = region;
+        same_node->capabilities = capabilities;
+        same_node->last_seen_ms = now_ms;
+        return LORA_TRUNK_NEIGHBOR_REFRESHED;
+    }
+
+    lora_trunk_neighbor_t *entry = free_entry ? free_entry : oldest;
+    if (!entry) {
+        return LORA_TRUNK_NEIGHBOR_COLLISION;
+    }
+    lora_trunk_neighbor_result_t result =
+        free_entry ? LORA_TRUNK_NEIGHBOR_LEARNED
+                   : LORA_TRUNK_NEIGHBOR_EVICTED;
+    memset(entry, 0, sizeof(*entry));
+    entry->in_use = true;
+    memcpy(entry->node_id, node_id, LORA_TRUNK_V3_NODE_ID_LEN);
+    memcpy(entry->boot_epoch, boot_epoch, 8);
+    entry->freshness = freshness;
+    entry->region = region;
+    entry->capabilities = capabilities;
+    entry->last_seen_ms = now_ms;
+    return result;
 }
 
 lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
@@ -287,6 +420,7 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
     lora_trunk_neighbor_t *free_entry = NULL;
     lora_trunk_neighbor_t *oldest = NULL;
     lora_trunk_neighbor_t *same_route = NULL;
+    lora_trunk_neighbor_t *unauthenticated_node = NULL;
     bool collision = false;
     for (size_t i = 0; i < LORA_TRUNK_NEIGHBOR_CAPACITY; ++i) {
         lora_trunk_neighbor_t *entry = &table->entries[i];
@@ -300,14 +434,20 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
             (!oldest || entry->last_seen_ms < oldest->last_seen_ms)) {
             oldest = entry;
         }
-        if (memcmp(entry->node_id, node_id,
-                   LORA_TRUNK_V3_NODE_ID_LEN) == 0 &&
+        bool same_node =
+            memcmp(entry->node_id, node_id,
+                   LORA_TRUNK_V3_NODE_ID_LEN) == 0;
+        if (same_node && entry->identity_authenticated &&
             memcmp(entry->signing_key, signing_key,
                    LORA_TRUNK_SIGNING_KEY_LEN) != 0) {
             entry->quarantined = true;
             collision = true;
         }
-        if (memcmp(entry->reachable_peer, reachable_peer,
+        if (same_node && !entry->identity_authenticated) {
+            unauthenticated_node = entry;
+        }
+        if (entry->identity_authenticated &&
+            memcmp(entry->reachable_peer, reachable_peer,
                    LORA_TRUNK_V3_NODE_ID_LEN) == 0 &&
             memcmp(entry->signing_key, signing_key,
                    LORA_TRUNK_SIGNING_KEY_LEN) == 0) {
@@ -327,15 +467,22 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
         return LORA_TRUNK_NEIGHBOR_REFRESHED;
     }
 
-    lora_trunk_neighbor_t *entry = free_entry ? free_entry : oldest;
+    lora_trunk_neighbor_t *entry =
+        unauthenticated_node
+            ? unauthenticated_node
+            : (free_entry ? free_entry : oldest);
     if (!entry) {
         return LORA_TRUNK_NEIGHBOR_COLLISION;
     }
     lora_trunk_neighbor_result_t result =
-        free_entry ? LORA_TRUNK_NEIGHBOR_LEARNED
-                   : LORA_TRUNK_NEIGHBOR_EVICTED;
-    memset(entry, 0, sizeof(*entry));
+        unauthenticated_node || free_entry
+            ? LORA_TRUNK_NEIGHBOR_LEARNED
+            : LORA_TRUNK_NEIGHBOR_EVICTED;
+    if (!unauthenticated_node) {
+        memset(entry, 0, sizeof(*entry));
+    }
     entry->in_use = true;
+    entry->identity_authenticated = true;
     memcpy(entry->node_id, node_id, LORA_TRUNK_V3_NODE_ID_LEN);
     memcpy(entry->reachable_peer, reachable_peer,
            LORA_TRUNK_V3_NODE_ID_LEN);
@@ -359,6 +506,7 @@ bool lora_trunk_neighbor_route(
     for (size_t i = 0; i < LORA_TRUNK_NEIGHBOR_CAPACITY; ++i) {
         const lora_trunk_neighbor_t *entry = &table->entries[i];
         if (!entry->in_use || entry->quarantined ||
+            !entry->identity_authenticated ||
             memcmp(entry->reachable_peer, reachable_peer,
                    LORA_TRUNK_V3_NODE_ID_LEN) != 0 ||
             now_ms < entry->last_seen_ms ||

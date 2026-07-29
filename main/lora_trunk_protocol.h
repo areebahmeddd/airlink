@@ -23,6 +23,7 @@ extern "C" {
 #define LORA_TRUNK_V3_MAX_PAYLOAD \
     (LORA_TRUNK_V3_MAX_FRAME_LEN - LORA_TRUNK_V3_HEADER_LEN)
 #define LORA_TRUNK_MAX_FRAGMENTS 5
+#define LORA_TRUNK_BEACON_REGION_COUNT 2
 
 #define LORA_TRUNK_V3_CAP_PROTOCOL 0x0001u
 
@@ -31,6 +32,7 @@ typedef enum {
     LORA_TRUNK_KIND_BITMAP_ACK = 2,
     LORA_TRUNK_KIND_COMPLETE = 3,
     LORA_TRUNK_KIND_ABORT = 4,
+    LORA_TRUNK_KIND_BEACON = 5,
 } lora_trunk_kind_t;
 
 typedef enum {
@@ -89,15 +91,32 @@ void lora_trunk_make_transfer_id(
     const uint8_t boot_epoch[8], uint32_t counter,
     uint8_t out[LORA_TRUNK_V3_TRANSFER_ID_LEN]);
 
+/* Compact beacon: the ordinary v3 header carries version, capabilities, node
+ * ID, boot epoch, and freshness. hop_limit carries the one-byte region ID, so
+ * the complete beacon remains one 44-byte frame with no application payload. */
+bool lora_trunk_beacon_init(
+    lora_trunk_frame_t *frame,
+    const uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN],
+    const uint8_t boot_epoch[8], uint32_t freshness,
+    uint8_t region, uint16_t capabilities);
+
+bool lora_trunk_beacon_fields(
+    const lora_trunk_frame_t *frame, uint8_t *out_region,
+    uint32_t *out_freshness);
+
 #define LORA_TRUNK_NEIGHBOR_CAPACITY 12
 #define LORA_TRUNK_SIGNING_KEY_LEN 32
 
 typedef struct {
     bool in_use;
     bool quarantined;
+    bool identity_authenticated;
     uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN];
     uint8_t reachable_peer[LORA_TRUNK_V3_NODE_ID_LEN];
     uint8_t signing_key[LORA_TRUNK_SIGNING_KEY_LEN];
+    uint8_t boot_epoch[8];
+    uint32_t freshness;
+    uint8_t region;
     uint16_t capabilities;
     uint64_t last_seen_ms;
 } lora_trunk_neighbor_t;
@@ -111,9 +130,19 @@ typedef enum {
     LORA_TRUNK_NEIGHBOR_REFRESHED,
     LORA_TRUNK_NEIGHBOR_EVICTED,
     LORA_TRUNK_NEIGHBOR_COLLISION,
+    LORA_TRUNK_NEIGHBOR_STALE,
 } lora_trunk_neighbor_result_t;
 
 void lora_trunk_neighbor_table_init(lora_trunk_neighbor_table_t *table);
+
+/* Learns minimum viable radio reachability without treating the beacon as a
+ * BitChat identity proof. Repeated freshness values are ignored, and a new
+ * boot epoch starts a new freshness sequence. */
+lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_beacon(
+    lora_trunk_neighbor_table_t *table,
+    const uint8_t node_id[LORA_TRUNK_V3_NODE_ID_LEN],
+    const uint8_t boot_epoch[8], uint32_t freshness,
+    uint8_t region, uint16_t capabilities, uint64_t now_ms);
 
 /* Caller supplies identity data from a successfully verified signed announce.
  * A node ID observed with a different signing identity is quarantined. */

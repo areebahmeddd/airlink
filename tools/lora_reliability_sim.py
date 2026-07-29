@@ -356,3 +356,134 @@ class BoundedReassemblyModel:
         self.completed.append(transfer_id)
         self.completed = self.completed[-self.completed_capacity :]
         return True
+
+
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    node_count: int = 4
+    frame_loss: float = 0.3
+    intervals: int = 3
+    repetitions: int = 3
+    contention_slots: int = 32
+    seed: int = 1
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    discovered_links: int
+    possible_links: int
+    collision_frames: int
+    transmitted_frames: int
+
+    @property
+    def discovery_ratio(self) -> float:
+        if self.possible_links == 0:
+            return 1.0
+        return self.discovered_links / self.possible_links
+
+
+class DiscoveryChannelModel:
+    """Slotted executable model for randomized, repeated trunk beacons."""
+
+    def __init__(self, config: DiscoveryConfig):
+        if config.node_count < 2:
+            raise ValueError("discovery needs at least two nodes")
+        if not 0.0 <= config.frame_loss <= 1.0:
+            raise ValueError("frame loss must be between zero and one")
+        if (
+            config.intervals <= 0
+            or config.repetitions <= 0
+            or config.contention_slots <= 0
+            or config.repetitions > config.contention_slots
+        ):
+            raise ValueError("invalid discovery bounds")
+        self.config = config
+        self.random = random.Random(config.seed)
+
+    def run(self) -> DiscoveryResult:
+        discovered: set[tuple[int, int]] = set()
+        collisions = 0
+        transmitted = 0
+        for _interval in range(self.config.intervals):
+            slots: dict[int, list[int]] = {}
+            for sender in range(self.config.node_count):
+                selected: set[int] = set()
+                while len(selected) < self.config.repetitions:
+                    selected.add(
+                        self.random.randrange(self.config.contention_slots)
+                    )
+                for slot in selected:
+                    slots.setdefault(slot, []).append(sender)
+                    transmitted += 1
+            for senders in slots.values():
+                if len(senders) != 1:
+                    collisions += len(senders)
+                    continue
+                sender = senders[0]
+                for receiver in range(self.config.node_count):
+                    if receiver == sender:
+                        continue
+                    if self.random.random() >= self.config.frame_loss:
+                        discovered.add((receiver, sender))
+        possible = self.config.node_count * (self.config.node_count - 1)
+        return DiscoveryResult(
+            len(discovered), possible, collisions, transmitted
+        )
+
+
+def contention_window_ms(
+    frame_airtime_ms: int,
+    busy_attempt: int = 0,
+    relayed_broadcast: bool = False,
+) -> tuple[int, int]:
+    if frame_airtime_ms <= 0 or busy_attempt < 0:
+        raise ValueError("invalid contention parameters")
+    minimum = max(30, frame_airtime_ms // 4)
+    minimum += busy_attempt * (frame_airtime_ms // 8)
+    if relayed_broadcast:
+        minimum += frame_airtime_ms // 2
+    spread = max(120, frame_airtime_ms)
+    spread += busy_attempt * (frame_airtime_ms // 4)
+    if relayed_broadcast:
+        spread += frame_airtime_ms // 2
+    minimum = min(minimum, 15_000)
+    return minimum, min(minimum + spread, 20_000)
+
+
+def hidden_sender_delays(
+    frame_airtime_ms: int, attempts: int, seeds: tuple[int, int]
+) -> tuple[list[int], list[int]]:
+    if attempts <= 0:
+        raise ValueError("attempt count must be positive")
+    schedules: list[list[int]] = []
+    for seed in seeds:
+        source = random.Random(seed)
+        elapsed = 0
+        schedule = []
+        for attempt in range(attempts):
+            minimum, maximum = contention_window_ms(
+                frame_airtime_ms, attempt
+            )
+            elapsed += source.randint(minimum, maximum)
+            schedule.append(elapsed)
+        schedules.append(schedule)
+    return schedules[0], schedules[1]
+
+
+def bounded_ack_service(
+    ack_frames: int, data_frames: int, burst_maximum: int = 4
+) -> list[str]:
+    if ack_frames < 0 or data_frames < 0 or burst_maximum <= 0:
+        raise ValueError("invalid service bounds")
+    result: list[str] = []
+    ack_burst = 0
+    while ack_frames or data_frames:
+        if ack_frames and (not data_frames or ack_burst < burst_maximum):
+            result.append("ack")
+            ack_frames -= 1
+            ack_burst += 1
+        elif data_frames:
+            result.append("data")
+            data_frames -= 1
+            ack_burst = 0
+    return result

@@ -72,6 +72,12 @@ typedef struct {
     uint32_t resource_aborts;
     uint32_t neighbor_collisions;
     uint32_t neighbor_count;
+    uint32_t beacon_tx;
+    uint32_t beacon_rx;
+    uint32_t beacon_stale;
+    uint32_t beacon_budget_deferred;
+    uint32_t channel_backoffs;
+    uint32_t announce_tx;
 } bitle_lora_diag_t;
 
 /* Snapshot transport diagnostics. All counters are monotonic for the boot.
