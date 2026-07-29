@@ -161,6 +161,7 @@ static void process_courier_event(const noise_event_t *evt);
 static void process_sync_event(const noise_event_t *evt);
 static bool send_announce(noise_session_t *session);
 static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign);
+static esp_err_t encode_and_send_reserved(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign, bitle_link_reservation_t *reservation);
 static esp_err_t queue_event(const noise_event_t *evt, TickType_t wait_ticks);
 static bool enqueue_event(noise_evt_type_t type, uint16_t conn_handle, const uint8_t peer_id[8], bool initiator, const uint8_t *payload, uint16_t payload_len);
 static void handshake_task(void *arg);
@@ -1195,7 +1196,25 @@ static void format_hex(const uint8_t *data, size_t len, char *out, size_t out_le
     out[len * 2] = '\0';
 }
 
-static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign)
+static esp_err_t send_result_to_error(bitle_link_send_result_t result)
+{
+    switch (result) {
+    case BITLE_LINK_SEND_ACCEPTED:
+        return ESP_OK;
+    case BITLE_LINK_SEND_DEFERRED:
+        return ESP_ERR_TIMEOUT;
+    case BITLE_LINK_SEND_POLICY_DROPPED:
+        return ESP_ERR_NOT_SUPPORTED;
+    case BITLE_LINK_SEND_FAILED:
+    default:
+        return ESP_FAIL;
+    }
+}
+
+static esp_err_t encode_and_send_reserved(
+    uint16_t conn_handle, bitchat_message_type_t type,
+    const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len,
+    bool sign, bitle_link_reservation_t *reservation)
 {
     bitchat_packet_t packet;
     memset(&packet, 0, sizeof(packet));
@@ -1207,6 +1226,7 @@ static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t ty
     packet.timestamp_ms = bitchat_time_now_ms();
     if (!packet.timestamp_ms) {
         ESP_LOGW(TAG, "Skipping send; timestamp invalid for type=0x%02X", type);
+        bitle_link_cancel_send(reservation);
         return ESP_ERR_INVALID_STATE;
     }
     memcpy(packet.sender_id, s_peer_id, sizeof(packet.sender_id));
@@ -1226,10 +1246,24 @@ static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t ty
     size_t encoded_len = sizeof(buffer);
     if (!bitchat_packet_encode(&packet, buffer, &encoded_len, sizeof(buffer))) {
         ESP_LOGE(TAG, "Failed to encode packet type=0x%02X", type);
+        bitle_link_cancel_send(reservation);
         return ESP_FAIL;
     }
 
+    if (reservation) {
+        return send_result_to_error(bitle_link_commit_send(
+            reservation, buffer, (uint16_t)encoded_len));
+    }
     return bitle_link_send(conn_handle, buffer, (uint16_t)encoded_len);
+}
+
+static esp_err_t encode_and_send(
+    uint16_t conn_handle, bitchat_message_type_t type,
+    const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len,
+    bool sign)
+{
+    return encode_and_send_reserved(
+        conn_handle, type, recipient_id, payload, payload_len, sign, NULL);
 }
 
 static esp_err_t queue_event(const noise_event_t *evt, TickType_t wait_ticks)
@@ -1711,15 +1745,28 @@ bool noise_send_encrypted(uint16_t conn_handle, bitchat_noise_payload_type_t pay
         ESP_LOGW(TAG, "Payload too large for encryption");
         return false;
     }
+    bitle_link_reservation_t reservation = {0};
+    /* Reserve the LoRa pool slot or BLE mbuf before the cipher state consumes
+     * this explicit Noise nonce. A backpressured transport therefore leaves
+     * both the application nonce and NoiseCipherState unchanged. */
+    bitle_link_send_result_t reserve_result = bitle_link_reserve_send(
+        conn_handle, BITCHAT_MSG_NOISE_ENCRYPTED, &reservation);
+    if (reserve_result != BITLE_LINK_SEND_ACCEPTED) {
+        return false;
+    }
+    bitle_link_reservation_t *reserved_send = &reservation;
     framed[0] = (uint8_t)payload_type;
     memcpy(framed + 1, payload, payload_len);
     uint8_t ciphertext[NOISE_MAX_ENCRYPTED_PAYLOAD];
     size_t ciphertext_len = sizeof(ciphertext);
     if (!encrypt_payload(session, framed, payload_len + 1, ciphertext, &ciphertext_len)) {
+        bitle_link_cancel_send(reserved_send);
         ESP_LOGW(TAG, "Encryption failed for conn=%u", conn_handle);
         return false;
     }
-    return encode_and_send(conn_handle, BITCHAT_MSG_NOISE_ENCRYPTED, session->peer_id, ciphertext, ciphertext_len, true) == ESP_OK;
+    return encode_and_send_reserved(
+               conn_handle, BITCHAT_MSG_NOISE_ENCRYPTED, session->peer_id,
+               ciphertext, ciphertext_len, true, reserved_send) == ESP_OK;
 }
 
 esp_err_t noise_send_raw(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t recipient[8], const uint8_t *payload, size_t payload_len)
@@ -1883,4 +1930,3 @@ static void poll_session_maintenance(void)
         }
     }
 }
-

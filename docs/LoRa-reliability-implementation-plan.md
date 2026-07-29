@@ -61,7 +61,7 @@ The implementation is complete only when all of the following are true:
 |---|---|---|---|
 | 0. Baseline harness and observability | Complete | `d130a3a` | Host baseline, both firmware targets, and two-board SF10 smoke passed |
 | 1. Airtime-safe SX1262 operation | Complete | `028511e` | Host/profile tests, both firmware targets, and SF10-SF12 two-board radio tests passed |
-| 2. Atomic packet scheduling and backpressure | Pending | — | — |
+| 2. Atomic packet scheduling and backpressure | Complete | pending checkpoint | Concurrent saturation, both firmware targets, and two-board SF10 smoke passed |
 | 3. Addressed trunk protocol and migration | Pending | — | — |
 | 4. Packet-level reliability and reassembly | Pending | — | — |
 | 5. Discovery and shared-channel behavior | Pending | — | — |
@@ -206,23 +206,23 @@ give callers an honest transport result.
 
 ### Checklist
 
-- [ ] Replace the frame queue with a whole-packet TX descriptor queue, or reserve
+- [x] Replace the frame queue with a whole-packet TX descriptor queue, or reserve
       all required frame capacity atomically before enqueueing any fragment.
-- [ ] Use a bounded static packet pool so queueing does not add heap
+- [x] Use a bounded static packet pool so queueing does not add heap
       fragmentation to the hot path.
-- [ ] Define explicit send results: accepted, deferred/backpressured,
+- [x] Define explicit send results: accepted, deferred/backpressured,
       policy-dropped, and transport-failed.
-- [ ] Update `bitle_link` callers so policy drops are not reported as successful
+- [x] Update `bitle_link` callers so policy drops are not reported as successful
       transport delivery.
-- [ ] Ensure a Noise nonce or higher-layer state is not irreversibly advanced
+- [x] Ensure a Noise nonce or higher-layer state is not irreversibly advanced
       when the transport rejects a packet before transmission.
-- [ ] Give control traffic, ACKs, discovery, and user data explicit priorities
+- [x] Give control traffic, ACKs, discovery, and user data explicit priorities
       with starvation bounds.
-- [ ] Preserve packet ordering where the BitChat or Noise protocol requires it.
-- [ ] Add queue admission metrics by packet type and priority.
-- [ ] Add saturation tests with concurrent BLE relay, Noise response, beacon,
+- [x] Preserve packet ordering where the BitChat or Noise protocol requires it.
+- [x] Add queue admission metrics by packet type and priority.
+- [x] Add saturation tests with concurrent BLE relay, Noise response, beacon,
       courier, and sync traffic.
-- [ ] Add cancellation and cleanup tests for radio reset and link shutdown.
+- [x] Add cancellation and cleanup tests for radio reset and link shutdown.
 
 ### Success criteria
 
@@ -238,9 +238,43 @@ give callers an honest transport result.
 
 ### Milestone record
 
-- Status: Pending
+- Status: Complete
 - Evidence:
-- Commit:
+  - The frame queue is replaced by a 12-slot, 520-byte static whole-packet
+    pool. A packet is invisible to the consumer until commit, stays owned
+    through every fragment and retry, and is released on completion or every
+    terminal error path.
+  - The portable scheduler test races BLE relay, Noise response, beacon,
+    courier, and sync producer classes. Forty concurrent attempts produce
+    exactly 12 complete admissions and 28 deferred results. A separate race
+    for one remaining slot produces one acceptance and one deferral, with no
+    partial descriptor.
+  - FIFO order is retained within each traffic class. The weighted
+    control/user/control/discovery/user/bulk rotation services every
+    continuously queued class within six selections. ACKs remain the highest
+    immediate priority but are capped at a four-frame burst before queued
+    packet traffic receives an opportunity.
+  - `bitle_link` exposes accepted, deferred, policy-dropped, and failed
+    outcomes. Broadcast accounting counts only accepted ownership. LoRa
+    policy decisions are no longer reported as successful sends.
+  - Two-phase reservations secure a LoRa packet slot or BLE mbuf before Noise
+    encryption advances its explicit nonce. A rejected reservation changes
+    neither the application nonce nor the cipher state.
+  - Host cancellation tests release queued, reserved, and in-flight slots.
+    Firmware shutdown cancels the complete pool after stopping the task;
+    successful radio recovery retains the in-flight packet, while terminal
+    recovery and retry failures release it.
+  - ESP-IDF 6.0 builds pass for the Heltec V3 ESP32-S3 configuration and the
+    BLE-only ESP32-C3 target.
+  - A two-board SF10 diagnostic run exchanged one- through five-fragment
+    scheduled packets. Both nodes reported zero radio timeouts, command
+    errors, BUSY timeouts, recovery failures, and watchdog events. Pool
+    high-water marks remained below the 12-slot bound, there were no
+    backpressure events, and snapshots satisfied the ownership invariant:
+    every accepted descriptor was either released or visibly in flight.
+  - Both test boards were restored to the normal SF10 image with diagnostic
+    smoke disabled after the capture.
+- Commit: pending checkpoint
 - Suggested commit subject: `refactor(lora): queue trunk packets atomically`
 
 ## Milestone 3: Addressed trunk protocol and migration

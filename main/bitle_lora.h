@@ -16,6 +16,7 @@
  */
 
 #include "esp_err.h"
+#include "lora_tx_scheduler.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -46,6 +47,11 @@ typedef struct {
     uint32_t completed_packets;
     uint32_t queue_depth;
     uint32_t queue_high_water;
+    uint32_t packet_accepted[LORA_TX_PRIORITY_COUNT];
+    uint32_t packet_deferred[LORA_TX_PRIORITY_COUNT];
+    uint32_t policy_drops;
+    uint32_t packet_released;
+    uint32_t packet_cancelled;
     uint32_t config_rejections;
     uint32_t radio_command_errors;
     uint32_t radio_busy_timeouts;
@@ -57,6 +63,10 @@ typedef struct {
 /* Snapshot transport diagnostics. All counters are monotonic for the boot.
  * Safe before radio initialization; the returned structure will be zeroed. */
 void bitle_lora_get_diag(bitle_lora_diag_t *out);
+
+/* Stops the link task and atomically releases every queued or in-flight TX
+ * packet. Safe to call when the radio was never detected. */
+void bitle_lora_shutdown(void);
 
 #ifdef __cplusplus
 }

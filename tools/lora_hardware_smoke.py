@@ -16,11 +16,17 @@ import serial
 
 PACKET_RE = re.compile(r"trunk RX packet len=(\d+).*frags=(\d+)")
 RAW_RE = re.compile(r"trunk raw RX len=(\d+) rssi=(-?\d+) snr=(-?\d+)")
-TX_RE = re.compile(r"trunk TX .*len=(\d+) frags=(\d+)")
+TX_RE = re.compile(r"trunk (?:TX|accepted) .*len=(\d+) frags=(\d+)")
 PROFILE_RE = re.compile(r"trunk up: region=(\w+).* SF(\d+).*preamble=(\d+)")
 DIAG_RE = re.compile(
     r"tmo=(\d+).*radio_err=(\d+).*busy_tmo=(\d+).*"
     r"recover=(\d+)/(\d+).*tx_watchdog=(\d+)"
+)
+SCHEDULER_DIAG_RE = re.compile(
+    r"q_full=(\d+) q=(\d+)/(\d+).*"
+    r"admit=(\d+)/(\d+)/(\d+)/(\d+) "
+    r"defer=(\d+)/(\d+)/(\d+)/(\d+) "
+    r"policy=(\d+) release=(\d+) cancel=(\d+)"
 )
 
 
@@ -122,6 +128,25 @@ def main() -> int:
                         "tx_watchdog_recoveries": int(match.group(6)),
                     }
                 )
+            if match := SCHEDULER_DIAG_RE.search(line):
+                scheduler_diag = {
+                    "queue_full": int(match.group(1)),
+                    "pool_depth": int(match.group(2)),
+                    "pool_high_water": int(match.group(3)),
+                    "accepted_by_priority": [
+                        int(match.group(index)) for index in range(4, 8)
+                    ],
+                    "deferred_by_priority": [
+                        int(match.group(index)) for index in range(8, 12)
+                    ],
+                    "policy_drops": int(match.group(12)),
+                    "released": int(match.group(13)),
+                    "cancelled": int(match.group(14)),
+                }
+                if summary[label]["diagnostics"]:
+                    summary[label]["diagnostics"][-1].update(scheduler_diag)
+                else:
+                    summary[label]["diagnostics"].append(scheduler_diag)
             if "TX watchdog expired" in line:
                 summary[label]["events"]["tx_watchdog_expired"] += 1
             if "radio recovered on attempt" in line:

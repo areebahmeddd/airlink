@@ -8,7 +8,6 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
@@ -18,6 +17,7 @@
 #include "bitle_stats.h"
 #include "lora_airtime.h"
 #include "lora_region.h"
+#include "lora_tx_scheduler.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
 #include "sx1262.h"
@@ -124,10 +124,10 @@ static const char *TAG = "bitle_lora";
 #define ARQ_MARGIN_MS    1200
 
 /* Channel access: CAD (listen-before-talk) + random backoff before TX. */
-#define TX_QUEUE_DEPTH   12
 #define CAD_RETRIES      5
 #define CAD_BACKOFF_MIN  30
 #define CAD_BACKOFF_SPAN 120
+#define ACK_BURST_MAX    4
 
 typedef struct {
     uint16_t len;
@@ -135,7 +135,10 @@ typedef struct {
     uint8_t data[SX1262_MAX_PAYLOAD];
 } lora_frame_t;
 
-static QueueHandle_t s_tx_queue;
+_Static_assert(BITCHAT_BLE_MAX_PACKET_SIZE <= LORA_TX_PACKET_MAX_LEN,
+               "LoRa packet pool must hold the largest BitChat packet");
+
+static lora_tx_scheduler_t s_tx_scheduler;
 static TaskHandle_t s_task;
 static bool s_active;
 static uint16_t s_tx_seq;
@@ -189,15 +192,19 @@ static void diag_inc(uint32_t *counter)
     taskEXIT_CRITICAL(&s_gov_mux);
 }
 
-static void diag_note_queue_depth(void)
+/* Caller holds s_gov_mux. */
+static void diag_sync_scheduler_locked(void)
 {
-    uint32_t depth = s_tx_queue ? uxQueueMessagesWaiting(s_tx_queue) : 0;
-    taskENTER_CRITICAL(&s_gov_mux);
-    s_diag.queue_depth = depth;
-    if (depth > s_diag.queue_high_water) {
-        s_diag.queue_high_water = depth;
+    lora_tx_scheduler_metrics_t metrics;
+    lora_tx_scheduler_metrics(&s_tx_scheduler, &metrics);
+    s_diag.queue_depth = metrics.in_use;
+    s_diag.queue_high_water = metrics.high_water;
+    s_diag.packet_released = metrics.released;
+    s_diag.packet_cancelled = metrics.cancelled;
+    for (size_t priority = 0; priority < LORA_TX_PRIORITY_COUNT; ++priority) {
+        s_diag.packet_accepted[priority] = metrics.accepted[priority];
+        s_diag.packet_deferred[priority] = metrics.deferred[priority];
     }
-    taskEXIT_CRITICAL(&s_gov_mux);
 }
 
 /* Per-origin announce throttle (call inside the governor critical section).
@@ -230,9 +237,9 @@ static bool announce_throttled(const uint8_t *sender, uint64_t now)
     return false;
 }
 
-/* Admission + governor for one whole encoded packet. Returns true if the
- * packet (all its fragments) is cleared to transmit, debiting airtime. */
-static bool trunk_admit(const uint8_t *data, uint16_t len)
+/* Admission + governor for one whole encoded packet. Caller holds s_gov_mux,
+ * which couples the policy state change to the scheduler admission. */
+static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
 {
     if (len < PKT_MIN_LEN) {
         return false;
@@ -268,10 +275,8 @@ static bool trunk_admit(const uint8_t *data, uint16_t len)
         airtime += trunk_airtime_ms(TRUNK_HDR_LEN + chunk);
     }
 
-    taskENTER_CRITICAL(&s_gov_mux);
-    /* Sample the clock inside the lock: reading it before could let another
-     * task advance s_gov_last_ms past our now, and the unsigned delta below
-     * would underflow to a huge value and saturate the credit. */
+    /* Reading the clock under the lock prevents another producer from
+     * advancing s_gov_last_ms past this sample. */
     uint64_t now = esp_timer_get_time() / 1000ULL;
     /* Refill the shared airtime credit. */
     s_gov_credit_ms += (double)(now - s_gov_last_ms) * s_gov_refill_frac;
@@ -287,12 +292,10 @@ static bool trunk_admit(const uint8_t *data, uint16_t len)
      * origin's next transmittable announce. */
     if (governed) {
         if (s_gov_credit_ms < (double)airtime) {
-            taskEXIT_CRITICAL(&s_gov_mux);
             ESP_LOGD(TAG, "airtime budget low; deferring announce");
             return false;
         }
         if (announce_throttled(data + PKT_SENDER_OFF, now)) {
-            taskEXIT_CRITICAL(&s_gov_mux);
             return false;
         }
     }
@@ -300,7 +303,6 @@ static bool trunk_admit(const uint8_t *data, uint16_t len)
     if (s_gov_credit_ms < -GOV_BURST_MS) {
         s_gov_credit_ms = -GOV_BURST_MS;
     }
-    taskEXIT_CRITICAL(&s_gov_mux);
     return true;
 }
 
@@ -375,67 +377,214 @@ static uint16_t trunk_true_len(const uint8_t *data, uint16_t len)
     return (real <= len) ? (uint16_t)real : len;
 }
 
-/* Mesh -> trunk: fragment and queue one encoded packet. Runs on the
- * caller's task (NimBLE host or noise worker); only queues. */
-static int lora_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
+static lora_tx_priority_t trunk_priority(uint8_t type)
+{
+    switch (type) {
+    case BITCHAT_MSG_NOISE_HANDSHAKE:
+    case BITCHAT_MSG_LEAVE:
+    case BITCHAT_MSG_REQUEST_SYNC:
+    case BITLE_MSG_OTA_MANIFEST:
+    case BITLE_MSG_OTA_REQ:
+    case BITLE_MSG_OTA_STATUS:
+        return LORA_TX_PRIORITY_CONTROL;
+    case BITCHAT_MSG_ANNOUNCE:
+    case BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE:
+    case BITCHAT_MSG_PREKEY_BUNDLE:
+        return LORA_TX_PRIORITY_DISCOVERY;
+    case BITLE_MSG_OTA_CHUNK:
+        return LORA_TX_PRIORITY_BULK;
+    default:
+        return LORA_TX_PRIORITY_USER;
+    }
+}
+
+static bitle_link_send_result_t lora_link_reserve(
+    uint16_t handle, uint8_t packet_type, uintptr_t *out_token)
 {
     (void)handle;
-    if (!s_active || len == 0 || len > BITCHAT_BLE_MAX_PACKET_SIZE) {
-        return -1;
+    if (!s_active || !out_token) {
+        return BITLE_LINK_SEND_FAILED;
     }
-    /* Trim BLE padding before it costs LoRa airtime. */
-    len = trunk_true_len(data, len);
-    /* Type-based admission + per-origin throttle + airtime governor, applied
-     * atomically to the whole packet so a packet is never partially sent. A
-     * policy decline is a handled outcome, not a transport failure (return 0
-     * so it does not read as a broken link); only a full radio queue is an
-     * actual send failure. */
-    if (!trunk_admit(data, len)) {
-        return 0;
-    }
-    uint8_t type = data[PKT_TYPE_OFF];
-    /* Announces are periodic broadcast discovery; everything else (DMs,
-     * handshakes, courier, acks-of-messages) gets per-frame ARQ. */
-    bool want_ack = !(type == BITCHAT_MSG_ANNOUNCE ||
-                      type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE);
-    uint8_t total = (uint8_t)((len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
-    ESP_LOGI(TAG, "trunk TX type=0x%02X len=%u frags=%u arq=%d", type, len, total, want_ack);
-    bitle_stats_note_activity(BITLE_LANE_TRUNK, 1);
-    /* Atomic across concurrent callers (NimBLE host, noise worker, lora_task
-     * beacon): a duplicated seq would collide two packets into one remote
-     * reassembly slot and corrupt both. Unique seq is sufficient — the
-     * receiver keys slots on (src,seq), so interleaved fragments still sort. */
+    lora_tx_priority_t priority = trunk_priority(packet_type);
+    lora_tx_handle_t reserved = LORA_TX_HANDLE_INVALID;
+
     taskENTER_CRITICAL(&s_gov_mux);
-    uint16_t seq = ++s_tx_seq;
+    lora_tx_admit_result_t result = lora_tx_scheduler_reserve(
+        &s_tx_scheduler, priority, &reserved);
+    if (result == LORA_TX_ADMIT_DEFERRED) {
+        s_diag.queue_full++;
+    }
+    diag_sync_scheduler_locked();
     taskEXIT_CRITICAL(&s_gov_mux);
 
-    for (uint8_t idx = 0; idx < total; ++idx) {
-        lora_frame_t frame;
-        uint16_t off = (uint16_t)idx * TRUNK_CHUNK_TX;
-        uint16_t chunk = len - off < TRUNK_CHUNK_TX ? len - off : TRUNK_CHUNK_TX;
-        uint8_t *h = frame.data;
-        h[0] = TRUNK_MAGIC0;
-        h[1] = TRUNK_MAGIC1;
-        h[2] = TRUNK_VERSION;
-        h[3] = want_ack ? FTYPE_ACK_REQ : 0x00;
-        memcpy(h + 4, s_src_tag, 4);
-        memset(h + 8, 0, 4);           /* dst: broadcast */
-        h[12] = seq >> 8;
-        h[13] = seq & 0xFF;
-        h[14] = idx;
-        h[15] = total;
-        memcpy(h + TRUNK_HDR_LEN, data + off, chunk);
-        frame.len = TRUNK_HDR_LEN + chunk;
-        frame.want_ack = want_ack;
-        if (xQueueSend(s_tx_queue, &frame, 0) != pdTRUE) {
-            diag_inc(&s_diag.queue_full);
-            diag_note_queue_depth();
-            ESP_LOGW(TAG, "TX queue full; dropping packet seq=%u", seq);
-            return -1;
-        }
-        diag_note_queue_depth();
+    if (result != LORA_TX_ADMIT_ACCEPTED) {
+        return result == LORA_TX_ADMIT_DEFERRED
+                   ? BITLE_LINK_SEND_DEFERRED
+                   : BITLE_LINK_SEND_FAILED;
     }
-    return 0;
+    *out_token = reserved;
+    return BITLE_LINK_SEND_ACCEPTED;
+}
+
+static void lora_link_cancel(uint16_t handle, uintptr_t token)
+{
+    (void)handle;
+    if (token >= LORA_TX_PACKET_POOL_SIZE) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_gov_mux);
+    lora_tx_scheduler_cancel(
+        &s_tx_scheduler, (lora_tx_handle_t)token);
+    diag_sync_scheduler_locked();
+    taskEXIT_CRITICAL(&s_gov_mux);
+}
+
+static bitle_link_send_result_t lora_link_commit(
+    uint16_t handle, uintptr_t token, const uint8_t *data, uint16_t len)
+{
+    (void)handle;
+    if (!data || len == 0 || len > BITCHAT_BLE_MAX_PACKET_SIZE ||
+        token >= LORA_TX_PACKET_POOL_SIZE) {
+        lora_link_cancel(handle, token);
+        return BITLE_LINK_SEND_FAILED;
+    }
+    len = trunk_true_len(data, len);
+    if (len < PKT_MIN_LEN) {
+        lora_link_cancel(handle, token);
+        return BITLE_LINK_SEND_FAILED;
+    }
+
+    uint8_t type = data[PKT_TYPE_OFF];
+    lora_tx_priority_t priority = trunk_priority(type);
+    lora_tx_handle_t reserved = (lora_tx_handle_t)token;
+    uint16_t sequence = 0;
+    bool committed = false;
+
+    taskENTER_CRITICAL(&s_gov_mux);
+    const lora_tx_packet_t *reservation =
+        lora_tx_scheduler_packet(&s_tx_scheduler, reserved);
+    if (!s_active || !reservation || reservation->len != 0 ||
+        reservation->priority != priority) {
+        lora_tx_scheduler_cancel(&s_tx_scheduler, reserved);
+        diag_sync_scheduler_locked();
+        taskEXIT_CRITICAL(&s_gov_mux);
+        return BITLE_LINK_SEND_FAILED;
+    }
+    if (!trunk_admit_locked(data, len)) {
+        s_diag.policy_drops++;
+        lora_tx_scheduler_cancel(&s_tx_scheduler, reserved);
+        diag_sync_scheduler_locked();
+        taskEXIT_CRITICAL(&s_gov_mux);
+        return BITLE_LINK_SEND_POLICY_DROPPED;
+    }
+    sequence = (uint16_t)(s_tx_seq + 1);
+    committed = lora_tx_scheduler_commit(
+        &s_tx_scheduler, reserved, data, len, type, sequence);
+    if (committed) {
+        s_tx_seq = sequence;
+    } else {
+        lora_tx_scheduler_cancel(&s_tx_scheduler, reserved);
+    }
+    diag_sync_scheduler_locked();
+    taskEXIT_CRITICAL(&s_gov_mux);
+
+    if (!committed) {
+        return BITLE_LINK_SEND_FAILED;
+    }
+    uint8_t total =
+        (uint8_t)((len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
+    ESP_LOGI(TAG,
+             "trunk accepted type=0x%02X len=%u frags=%u priority=%u seq=%u",
+             type, len, total, priority, sequence);
+    bitle_stats_note_activity(BITLE_LANE_TRUNK, 1);
+    if (s_task) {
+        xTaskNotifyGive(s_task);
+    }
+    return BITLE_LINK_SEND_ACCEPTED;
+}
+
+/* Mesh -> trunk convenience path. Reservation happens before policy state or
+ * sequence assignment changes, and commit publishes the whole packet once. */
+static bitle_link_send_result_t lora_link_send(
+    uint16_t handle, const uint8_t *data, uint16_t len)
+{
+    if (!data || len <= PKT_TYPE_OFF) {
+        return BITLE_LINK_SEND_FAILED;
+    }
+    uintptr_t token = 0;
+    bitle_link_send_result_t result =
+        lora_link_reserve(handle, data[PKT_TYPE_OFF], &token);
+    if (result != BITLE_LINK_SEND_ACCEPTED) {
+        return result;
+    }
+    return lora_link_commit(handle, token, data, len);
+}
+
+static bool tx_scheduler_dequeue(lora_tx_handle_t *out_handle)
+{
+    taskENTER_CRITICAL(&s_gov_mux);
+    bool dequeued =
+        lora_tx_scheduler_dequeue(&s_tx_scheduler, out_handle);
+    diag_sync_scheduler_locked();
+    taskEXIT_CRITICAL(&s_gov_mux);
+    return dequeued;
+}
+
+static void tx_scheduler_release(lora_tx_handle_t handle)
+{
+    if (handle == LORA_TX_HANDLE_INVALID) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_gov_mux);
+    lora_tx_scheduler_release(&s_tx_scheduler, handle);
+    diag_sync_scheduler_locked();
+    taskEXIT_CRITICAL(&s_gov_mux);
+}
+
+static bool tx_scheduler_has_queued(void)
+{
+    taskENTER_CRITICAL(&s_gov_mux);
+    bool queued = lora_tx_scheduler_queued(&s_tx_scheduler) != 0;
+    taskEXIT_CRITICAL(&s_gov_mux);
+    return queued;
+}
+
+static bool build_tx_fragment(lora_tx_handle_t handle, uint8_t idx,
+                              lora_frame_t *frame, uint8_t *out_total)
+{
+    const lora_tx_packet_t *packet =
+        lora_tx_scheduler_packet(&s_tx_scheduler, handle);
+    if (!packet || !frame || !out_total) {
+        return false;
+    }
+    uint8_t total =
+        (uint8_t)((packet->len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
+    if (idx >= total) {
+        return false;
+    }
+    bool want_ack =
+        !(packet->type == BITCHAT_MSG_ANNOUNCE ||
+          packet->type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE);
+    uint16_t off = (uint16_t)idx * TRUNK_CHUNK_TX;
+    uint16_t remaining = packet->len - off;
+    uint16_t chunk =
+        remaining < TRUNK_CHUNK_TX ? remaining : TRUNK_CHUNK_TX;
+    uint8_t *header = frame->data;
+    header[0] = TRUNK_MAGIC0;
+    header[1] = TRUNK_MAGIC1;
+    header[2] = TRUNK_VERSION;
+    header[3] = want_ack ? FTYPE_ACK_REQ : 0x00;
+    memcpy(header + 4, s_src_tag, 4);
+    memset(header + 8, 0, 4);
+    header[12] = packet->sequence >> 8;
+    header[13] = packet->sequence & 0xFF;
+    header[14] = idx;
+    header[15] = total;
+    memcpy(header + TRUNK_HDR_LEN, packet->data + off, chunk);
+    frame->len = TRUNK_HDR_LEN + chunk;
+    frame->want_ack = want_ack;
+    *out_total = total;
+    return true;
 }
 
 /* Acks bypass the data queue entirely. When both ends have ARQ frames in
@@ -597,10 +746,41 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
 #define BEACON_FIRST_MS    5000ULL
 #define BEACON_INTERVAL_MS 60000ULL
 
+static void drop_tx_packet(lora_tx_handle_t *handle, bool *have_pending)
+{
+    tx_scheduler_release(*handle);
+    *handle = LORA_TX_HANDLE_INVALID;
+    *have_pending = false;
+}
+
+/* Releases a completed packet, or builds the next fragment while retaining
+ * ownership of the same static-pool descriptor. */
+static bool advance_tx_packet(lora_tx_handle_t *handle, uint8_t *fragment_idx,
+                              uint8_t fragment_total, lora_frame_t *frame)
+{
+    (*fragment_idx)++;
+    if (*fragment_idx >= fragment_total) {
+        tx_scheduler_release(*handle);
+        *handle = LORA_TX_HANDLE_INVALID;
+        return false;
+    }
+    uint8_t checked_total = 0;
+    if (!build_tx_fragment(*handle, *fragment_idx, frame, &checked_total) ||
+        checked_total != fragment_total) {
+        tx_scheduler_release(*handle);
+        *handle = LORA_TX_HANDLE_INVALID;
+        return false;
+    }
+    return true;
+}
+
 static void lora_task(void *arg)
 {
     (void)arg;
     lora_frame_t pending;
+    lora_tx_handle_t packet_handle = LORA_TX_HANDLE_INVALID;
+    uint8_t fragment_idx = 0;
+    uint8_t fragment_total = 0;
     bool have_pending = false;
     int cad_tries = 0;
     int arq_sends = 0;
@@ -608,6 +788,7 @@ static void lora_task(void *arg)
     bool tx_is_ack = false;
     bool awaiting_cad = false;
     bool awaiting_ack = false;
+    unsigned ack_burst = 0;
     uint64_t tx_watchdog_deadline = 0;
     uint64_t ack_deadline = 0;
     uint64_t next_beacon_ms = BEACON_FIRST_MS;
@@ -661,7 +842,9 @@ static void lora_task(void *arg)
                      "diag raw_rx=%lu crc=%lu tx=%lu tmo=%lu ack_rx=%lu ack_tx=%lu "
                      "ack_miss=%lu retry=%lu exhausted=%lu q_full=%lu q=%lu/%lu "
                      "rx_expire=%lu complete=%lu cfg_reject=%lu radio_err=%lu "
-                     "busy_tmo=%lu recover=%lu/%lu tx_watchdog=%lu",
+                     "busy_tmo=%lu recover=%lu/%lu tx_watchdog=%lu "
+                     "admit=%lu/%lu/%lu/%lu defer=%lu/%lu/%lu/%lu "
+                     "policy=%lu release=%lu cancel=%lu",
                      (unsigned long)diag.raw_rx_frames,
                      (unsigned long)diag.crc_errors,
                      (unsigned long)diag.tx_attempts,
@@ -681,7 +864,18 @@ static void lora_task(void *arg)
                      (unsigned long)diag.radio_busy_timeouts,
                      (unsigned long)diag.radio_recoveries,
                      (unsigned long)diag.radio_recovery_failures,
-                     (unsigned long)diag.tx_watchdog_recoveries);
+                     (unsigned long)diag.tx_watchdog_recoveries,
+                     (unsigned long)diag.packet_accepted[LORA_TX_PRIORITY_CONTROL],
+                     (unsigned long)diag.packet_accepted[LORA_TX_PRIORITY_USER],
+                     (unsigned long)diag.packet_accepted[LORA_TX_PRIORITY_DISCOVERY],
+                     (unsigned long)diag.packet_accepted[LORA_TX_PRIORITY_BULK],
+                     (unsigned long)diag.packet_deferred[LORA_TX_PRIORITY_CONTROL],
+                     (unsigned long)diag.packet_deferred[LORA_TX_PRIORITY_USER],
+                     (unsigned long)diag.packet_deferred[LORA_TX_PRIORITY_DISCOVERY],
+                     (unsigned long)diag.packet_deferred[LORA_TX_PRIORITY_BULK],
+                     (unsigned long)diag.policy_drops,
+                     (unsigned long)diag.packet_released,
+                     (unsigned long)diag.packet_cancelled);
             next_diag_ms = now + 60000ULL;
         }
 
@@ -708,7 +902,13 @@ static void lora_task(void *arg)
 #endif
                 awaiting_tx_done = false;
                 tx_watchdog_deadline = 0;
-                resume_rx_or_recover("TX_DONE resume RX");
+                if (!resume_rx_or_recover("TX_DONE resume RX")) {
+                    tx_is_ack = false;
+                    if (have_pending) {
+                        drop_tx_packet(&packet_handle, &have_pending);
+                    }
+                    break;
+                }
                 if (tx_is_ack) {
                     /* our ack went out; the interleave delayed any pending
                      * data frame's ack wait, so extend its deadline */
@@ -723,14 +923,23 @@ static void lora_task(void *arg)
                     ack_deadline = esp_timer_get_time() / 1000ULL +
                                    trunk_airtime_ms(TRUNK_HDR_LEN) + ARQ_MARGIN_MS;
                 } else {
-                    have_pending = false;
+                    have_pending = advance_tx_packet(
+                        &packet_handle, &fragment_idx, fragment_total,
+                        &pending);
+                    cad_tries = 0;
+                    arq_sends = 0;
+                    s_ack_seen = false;
                 }
                 break;
             case SX1262_EVT_CAD_CLEAR:
                 awaiting_cad = false;
-                if (s_ack_count > 0) {
-                    /* acks always preempt data on a clear channel */
+                if (s_ack_count > 0 &&
+                    (!(have_pending || tx_scheduler_has_queued()) ||
+                     ack_burst < ACK_BURST_MAX)) {
+                    /* ACKs preempt boundedly; after four, queued packet
+                     * traffic gets one transmission opportunity. */
                     if (transmit_ack_now()) {
+                        ack_burst++;
                         awaiting_tx_done = true;
                         tx_is_ack = true;
                         tx_watchdog_deadline =
@@ -749,8 +958,9 @@ static void lora_task(void *arg)
                             esp_timer_get_time() / 1000ULL +
                             sx1262_tx_watchdog_ms(pending.len);
                         arq_sends++;
+                        ack_burst = 0;
                     } else {
-                        have_pending = false;
+                        drop_tx_packet(&packet_handle, &have_pending);
                         recover_radio("data transmit command");
                     }
                 }
@@ -763,16 +973,21 @@ static void lora_task(void *arg)
                     if (sx1262_start_cad() == ESP_OK) {
                         awaiting_cad = true;
                     } else {
-                        have_pending = false;
+                        drop_tx_packet(&packet_handle, &have_pending);
                         recover_radio("CAD retry command");
                     }
                 } else {
-                    /* channel persistently busy: drop the frame */
-                    have_pending = false;
+                    /* Channel persistently busy: reject the complete packet;
+                     * sending only its earlier fragments cannot complete. */
+                    if (have_pending) {
+                        drop_tx_packet(&packet_handle, &have_pending);
+                    }
                     resume_rx_or_recover("CAD busy resume RX");
                 }
                 break;
             case SX1262_EVT_TIMEOUT:
+                {
+                bool timed_out_ack = tx_is_ack;
                 diag_inc(&s_diag.tx_timeouts);
                 awaiting_tx_done = false;
                 tx_watchdog_deadline = 0;
@@ -781,11 +996,16 @@ static void lora_task(void *arg)
                 /* A radio timeout is an expected, separately counted delivery
                  * failure. Re-enter RX and let an ack-requested data frame use
                  * its remaining ARQ attempts. */
-                resume_rx_or_recover("radio TX timeout");
-                if (!have_pending || !pending.want_ack || arq_sends >= ARQ_TRIES) {
-                    have_pending = false;
+                if (!resume_rx_or_recover("radio TX timeout")) {
+                    if (have_pending) {
+                        drop_tx_packet(&packet_handle, &have_pending);
+                    }
+                } else if (!timed_out_ack && have_pending &&
+                           (!pending.want_ack || arq_sends >= ARQ_TRIES)) {
+                    drop_tx_packet(&packet_handle, &have_pending);
                 }
                 break;
+                }
             case SX1262_EVT_RX_CRC_ERROR:
                 diag_inc(&s_diag.crc_errors);
                 /* Logged for link-quality visibility: a frame arrived but
@@ -799,7 +1019,9 @@ static void lora_task(void *arg)
                 tx_is_ack = false;
                 tx_watchdog_deadline = 0;
                 if (!recover_radio("IRQ status command")) {
-                    have_pending = false;
+                    if (have_pending) {
+                        drop_tx_packet(&packet_handle, &have_pending);
+                    }
                 }
                 break;
             default:
@@ -809,8 +1031,11 @@ static void lora_task(void *arg)
 
         /* Acks fly the moment the radio is free — no CAD, no queueing: the
          * peer is listening right after its TX and is waiting on us. */
-        if (s_ack_count > 0 && !awaiting_tx_done && !awaiting_cad) {
+        bool data_waiting = have_pending || tx_scheduler_has_queued();
+        if (s_ack_count > 0 && !awaiting_tx_done && !awaiting_cad &&
+            (!data_waiting || ack_burst < ACK_BURST_MAX)) {
             if (transmit_ack_now()) {
+                ack_burst++;
                 awaiting_tx_done = true;
                 tx_is_ack = true;
                 tx_watchdog_deadline =
@@ -832,7 +1057,9 @@ static void lora_task(void *arg)
             tx_is_ack = false;
             tx_watchdog_deadline = 0;
             if (!recover_radio("software TX watchdog")) {
-                have_pending = false;
+                if (have_pending) {
+                    drop_tx_packet(&packet_handle, &have_pending);
+                }
             }
         }
 
@@ -844,7 +1071,10 @@ static void lora_task(void *arg)
             if (s_ack_seen && s_ack_seq == pseq && s_ack_idx == pidx) {
                 s_ack_seen = false;
                 awaiting_ack = false;
-                have_pending = false;
+                have_pending = advance_tx_packet(
+                    &packet_handle, &fragment_idx, fragment_total, &pending);
+                cad_tries = 0;
+                arq_sends = 0;
             } else if (now2 >= ack_deadline) {
                 diag_inc(&s_diag.ack_misses);
                 awaiting_ack = false;
@@ -853,14 +1083,14 @@ static void lora_task(void *arg)
                     if (sx1262_start_cad() == ESP_OK) {
                         awaiting_cad = true;   /* retransmit */
                     } else {
-                        have_pending = false;
+                        drop_tx_packet(&packet_handle, &have_pending);
                         recover_radio("ARQ CAD command");
                     }
                 } else {
                     diag_inc(&s_diag.retry_exhaustion);
                     ESP_LOGW(TAG, "trunk frame lost after %d sends seq=%u idx=%u",
                              ARQ_TRIES, pseq, pidx);
-                    have_pending = false;
+                    drop_tx_packet(&packet_handle, &have_pending);
                 }
             }
         }
@@ -874,22 +1104,27 @@ static void lora_task(void *arg)
             if (sx1262_start_cad() == ESP_OK) {
                 awaiting_cad = true;
             } else {
-                have_pending = false;
+                drop_tx_packet(&packet_handle, &have_pending);
                 recover_radio("pending CAD command");
             }
         }
 
         if (!have_pending && !awaiting_tx_done && !awaiting_cad && !awaiting_ack &&
-            xQueueReceive(s_tx_queue, &pending, 0) == pdTRUE) {
-            diag_note_queue_depth();
-            have_pending = true;
+            tx_scheduler_dequeue(&packet_handle)) {
+            fragment_idx = 0;
+            have_pending = build_tx_fragment(
+                packet_handle, fragment_idx, &pending, &fragment_total);
+            if (!have_pending) {
+                drop_tx_packet(&packet_handle, &have_pending);
+                continue;
+            }
             cad_tries = 0;
             arq_sends = 0;
             s_ack_seen = false;
             if (sx1262_start_cad() == ESP_OK) {
                 awaiting_cad = true;
             } else {
-                have_pending = false;
+                drop_tx_packet(&packet_handle, &have_pending);
                 recover_radio("dequeue CAD command");
             }
         }
@@ -907,17 +1142,32 @@ void bitle_lora_get_diag(bitle_lora_diag_t *out)
         return;
     }
     taskENTER_CRITICAL(&s_gov_mux);
+    diag_sync_scheduler_locked();
     *out = s_diag;
     taskEXIT_CRITICAL(&s_gov_mux);
-    if (s_tx_queue) {
-        out->queue_depth = uxQueueMessagesWaiting(s_tx_queue);
-    }
     sx1262_diag_t radio_diag;
     sx1262_get_diag(&radio_diag);
     out->radio_command_errors = radio_diag.command_errors;
     out->radio_busy_timeouts = radio_diag.busy_timeouts;
     out->radio_recoveries = radio_diag.recoveries;
     out->radio_recovery_failures = radio_diag.recovery_failures;
+}
+
+void bitle_lora_shutdown(void)
+{
+    s_active = false;
+    bitle_link_unregister(BITLE_LORA_LINK_HANDLE);
+    TaskHandle_t task = s_task;
+    s_task = NULL;
+    if (task) {
+        vTaskDelete(task);
+    }
+    taskENTER_CRITICAL(&s_gov_mux);
+    lora_tx_scheduler_cancel_all(&s_tx_scheduler);
+    diag_sync_scheduler_locked();
+    taskEXIT_CRITICAL(&s_gov_mux);
+    s_ack_head = 0;
+    s_ack_count = 0;
 }
 
 esp_err_t bitle_lora_init(void)
@@ -1046,10 +1296,7 @@ esp_err_t bitle_lora_init(void)
     s_gov_credit_ms = GOV_BURST_MS;
     s_gov_last_ms = esp_timer_get_time() / 1000ULL;
 
-    s_tx_queue = xQueueCreate(TX_QUEUE_DEPTH, sizeof(lora_frame_t));
-    if (!s_tx_queue) {
-        return ESP_ERR_NO_MEM;
-    }
+    lora_tx_scheduler_init(&s_tx_scheduler);
     if (xTaskCreate(lora_task, "bitle_lora", 6144, NULL, tskIDLE_PRIORITY + 4, &s_task) != pdTRUE) {
         return ESP_ERR_NO_MEM;
     }
@@ -1059,13 +1306,23 @@ esp_err_t bitle_lora_init(void)
         ESP_LOGE(TAG, "radio init failed: %s", esp_err_to_name(err));
         vTaskDelete(s_task);
         s_task = NULL;
-        vQueueDelete(s_tx_queue);
-        s_tx_queue = NULL;
+        taskENTER_CRITICAL(&s_gov_mux);
+        lora_tx_scheduler_cancel_all(&s_tx_scheduler);
+        diag_sync_scheduler_locked();
+        taskEXIT_CRITICAL(&s_gov_mux);
         return err;
     }
 
     s_active = true;
-    bitle_link_register(BITLE_LORA_LINK_HANDLE, BITLE_LINK_LORA, lora_link_send);
+    err = bitle_link_register_reservable(
+        BITLE_LORA_LINK_HANDLE, BITLE_LINK_LORA, lora_link_send,
+        lora_link_reserve, lora_link_commit, lora_link_cancel);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "trunk link registration failed: %s",
+                 esp_err_to_name(err));
+        bitle_lora_shutdown();
+        return err;
+    }
     const lora_region_profile_t *active_profile = lora_region_profile(cfg.region);
     ESP_LOGI(TAG,
              "trunk up: region=%s %.3f MHz SF%u BW%lu preamble=%u +%ddBm "

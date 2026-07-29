@@ -40,18 +40,59 @@ typedef enum {
     BITLE_LINK_LORA,
 } bitle_link_type_t;
 
-typedef int (*bitle_link_send_fn_t)(uint16_t handle, const uint8_t *data, uint16_t len);
+typedef enum {
+    BITLE_LINK_SEND_ACCEPTED = 0,
+    BITLE_LINK_SEND_DEFERRED,
+    BITLE_LINK_SEND_POLICY_DROPPED,
+    BITLE_LINK_SEND_FAILED,
+} bitle_link_send_result_t;
+
+typedef bitle_link_send_result_t (*bitle_link_send_fn_t)(
+    uint16_t handle, const uint8_t *data, uint16_t len);
+typedef bitle_link_send_result_t (*bitle_link_reserve_fn_t)(
+    uint16_t handle, uint8_t packet_type, uintptr_t *out_token);
+typedef bitle_link_send_result_t (*bitle_link_commit_fn_t)(
+    uint16_t handle, uintptr_t token, const uint8_t *data, uint16_t len);
+typedef void (*bitle_link_cancel_fn_t)(uint16_t handle, uintptr_t token);
+
+typedef struct {
+    uint16_t handle;
+    uintptr_t token;
+    bitle_link_commit_fn_t commit_fn;
+    bitle_link_cancel_fn_t cancel_fn;
+    bool active;
+} bitle_link_reservation_t;
 
 esp_err_t bitle_link_init(void);
 
 /* Registers a link as ready to carry packets. Idempotent per handle. */
 esp_err_t bitle_link_register(uint16_t handle, bitle_link_type_t type, bitle_link_send_fn_t send_fn);
+esp_err_t bitle_link_register_reservable(
+    uint16_t handle, bitle_link_type_t type, bitle_link_send_fn_t send_fn,
+    bitle_link_reserve_fn_t reserve_fn, bitle_link_commit_fn_t commit_fn,
+    bitle_link_cancel_fn_t cancel_fn);
 void bitle_link_unregister(uint16_t handle);
 bool bitle_link_ready(uint16_t handle);
 
 /* Link type for a registered handle, or -1 when unknown. */
 int bitle_link_type_of(uint16_t handle);
 
+/* Detailed result for callers that need to distinguish backpressure from a
+ * permanent policy decision or a broken transport. ACCEPTED means the
+ * transport owns the packet; it does not imply end-to-end delivery. */
+bitle_link_send_result_t bitle_link_send_detailed(
+    uint16_t handle, const uint8_t *data, uint16_t len);
+
+/* Two-phase ownership for producers such as Noise that must secure transport
+ * capacity before advancing a nonce. Only links registered with reservation
+ * callbacks support this operation. */
+bitle_link_send_result_t bitle_link_reserve_send(
+    uint16_t handle, uint8_t packet_type, bitle_link_reservation_t *out);
+bitle_link_send_result_t bitle_link_commit_send(
+    bitle_link_reservation_t *reservation, const uint8_t *data, uint16_t len);
+void bitle_link_cancel_send(bitle_link_reservation_t *reservation);
+
+/* Compatibility wrapper for existing esp_err_t callers. */
 esp_err_t bitle_link_send(uint16_t handle, const uint8_t *data, uint16_t len);
 
 /* Sends to every registered link except exclude_handle (BITLE_LINK_NONE to
