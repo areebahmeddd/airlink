@@ -1855,6 +1855,27 @@ bool noise_verify_packet_signature(const bitchat_packet_t *packet, const uint8_t
                              (unsigned char *)packet->signature) == 0;
 }
 
+bool noise_verify_announce_identity(
+    const bitchat_packet_t *packet, uint8_t out_sign_key[32])
+{
+    if (!packet || !out_sign_key || packet->type != BITCHAT_MSG_ANNOUNCE ||
+        !packet->has_signature) {
+        return false;
+    }
+    noise_identity_t identity = {0};
+    if (!parse_announce_tlv(packet->payload, packet->payload_len, &identity)) {
+        return false;
+    }
+    uint8_t hash[32];
+    bitle_sha256(identity.noise_key, sizeof(identity.noise_key), hash);
+    if (memcmp(hash, packet->sender_id, sizeof(packet->sender_id)) != 0 ||
+        !noise_verify_packet_signature(packet, identity.sign_key)) {
+        return false;
+    }
+    memcpy(out_sign_key, identity.sign_key, sizeof(identity.sign_key));
+    return true;
+}
+
 void noise_poll(void)
 {
     /* Session maintenance runs on the worker task's receive timeout; nothing

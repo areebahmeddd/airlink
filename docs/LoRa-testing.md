@@ -16,6 +16,12 @@ frames at SF7 through SF12, including timeout conversion and 24-bit clamping.
 It also checks US915/EU868 boundaries, defaults, inference, profile mismatch
 rejection, and image-calibration selection.
 
+The same command also compiles the allocation-free v2/v3 trunk parser and v3
+encoder. Its protocol cases cover malformed headers, exact ACK matching,
+same-transfer isolation between senders, zero-ACK broadcast delivery to four
+nodes, neighbor collision quarantine, expiry, bounded eviction, and 100,000
+deterministic fuzz frames.
+
 The legacy-v2 simulator cases intentionally assert the original protocol
 failures: fixed reassembly expiry under retries, partial frame enqueue,
 acceptance of an ACK from the wrong source, and broadcast ACK implosion. The
@@ -56,8 +62,10 @@ the profile when the frequency is unambiguous.
 
 The production default keeps `CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE` disabled.
 For a controlled test, enable it on exactly one Heltec V3 build. That node
-transmits one synthetic packet at each of 1, 2, 3, 4, and 5 fragments, spaced
-12 seconds apart. Keep the receiving node on the normal build.
+waits until a signed direct announcement establishes an authenticated v3
+neighbor, then transmits one addressed synthetic packet at each of 1, 2, 3, 4,
+and 5 fragments, spaced 12 seconds apart. Keep the receiving node on the
+normal build.
 
 Capture both serial streams concurrently:
 
@@ -66,10 +74,12 @@ python tools/lora_hardware_smoke.py PORT_A PORT_B --seconds 90 --reset --quiet \
   --json-out /tmp/bitle-lora-smoke.json
 ```
 
-The capture summarizes TX and completed RX counts by fragment count and retains
-per-frame RSSI/SNR, the active profile, watchdog/recovery events, and periodic
-radio diagnostics. Raw serial output and JSON evidence may contain local
-device details, so keep it outside the repository.
+The capture summarizes TX and completed RX counts by fragment count, addressed
+diagnostic events, authenticated-neighbor learning, exact v3 ACK traffic, and
+parser rejection counters. It also retains per-frame RSSI/SNR, the active
+profile, watchdog/recovery events, and periodic radio diagnostics. Raw serial
+output and JSON evidence may contain local device details, so keep it outside
+the repository.
 
 Repeat with `CONFIG_BITLE_LORA_DEFAULT_SF` set to 10, 11, and 12 on both
 boards. At each SF, verify that the receiver records 136-byte frames and both

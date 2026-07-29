@@ -14,9 +14,14 @@ import time
 import serial
 
 
-PACKET_RE = re.compile(r"trunk RX packet len=(\d+).*frags=(\d+)")
-RAW_RE = re.compile(r"trunk raw RX len=(\d+) rssi=(-?\d+) snr=(-?\d+)")
+PACKET_RE = re.compile(r"trunk(?: v\d+)? RX packet len=(\d+).*frags=(\d+)")
+RAW_RE = re.compile(
+    r"trunk(?: v\d+)? raw RX len=(\d+) rssi=(-?\d+) snr=(-?\d+)"
+)
 TX_RE = re.compile(r"trunk (?:TX|accepted) .*len=(\d+) frags=(\d+)")
+SMOKE_RE = re.compile(
+    r"diagnostic smoke enqueue len=(\d+) expected_frags=(\d+) addressed=(\d+)"
+)
 PROFILE_RE = re.compile(r"trunk up: region=(\w+).* SF(\d+).*preamble=(\d+)")
 DIAG_RE = re.compile(
     r"tmo=(\d+).*radio_err=(\d+).*busy_tmo=(\d+).*"
@@ -27,6 +32,10 @@ SCHEDULER_DIAG_RE = re.compile(
     r"admit=(\d+)/(\d+)/(\d+)/(\d+) "
     r"defer=(\d+)/(\d+)/(\d+)/(\d+) "
     r"policy=(\d+) release=(\d+) cancel=(\d+)"
+)
+PROTOCOL_DIAG_RE = re.compile(
+    r"malformed=(\d+) unsupported=(\d+) ack_reject=(\d+) "
+    r"neighbors=(\d+) collision=(\d+)"
 )
 
 
@@ -103,6 +112,9 @@ def main() -> int:
                 summary[label]["rx_fragments"][match.group(2)] += 1
             if match := TX_RE.search(line):
                 summary[label]["tx_fragments"][match.group(2)] += 1
+            if match := SMOKE_RE.search(line):
+                mode = "addressed" if match.group(3) == "1" else "broadcast"
+                summary[label]["events"][f"smoke_{mode}"] += 1
             if match := RAW_RE.search(line):
                 summary[label]["raw"].append(
                     {
@@ -147,6 +159,24 @@ def main() -> int:
                     summary[label]["diagnostics"][-1].update(scheduler_diag)
                 else:
                     summary[label]["diagnostics"].append(scheduler_diag)
+            if match := PROTOCOL_DIAG_RE.search(line):
+                protocol_diag = {
+                    "malformed_frames": int(match.group(1)),
+                    "unsupported_versions": int(match.group(2)),
+                    "rejected_acks": int(match.group(3)),
+                    "neighbor_count": int(match.group(4)),
+                    "neighbor_collisions": int(match.group(5)),
+                }
+                if summary[label]["diagnostics"]:
+                    summary[label]["diagnostics"][-1].update(protocol_diag)
+                else:
+                    summary[label]["diagnostics"].append(protocol_diag)
+            if "authenticated neighbor" in line:
+                summary[label]["events"]["authenticated_neighbor"] += 1
+            if "v3 ack TX" in line:
+                summary[label]["events"]["v3_ack_tx"] += 1
+            if "v3 ack RX" in line:
+                summary[label]["events"]["v3_ack_rx"] += 1
             if "TX watchdog expired" in line:
                 summary[label]["events"]["tx_watchdog_expired"] += 1
             if "radio recovered on attempt" in line:

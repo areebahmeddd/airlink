@@ -115,6 +115,12 @@ bool noise_get_peer_identity(uint16_t conn_handle, uint8_t noise_key[32], uint8_
 /* Verifies an inbound packet's Ed25519 signature against a signing key
  * (rebuilds the padded canonical bytes exactly as the phones do). */
 bool noise_verify_packet_signature(const bitchat_packet_t *packet, const uint8_t sign_key[32]);
+
+/* Strictly verifies a current ANNOUNCE for LoRa neighbor learning: the sender
+ * must derive from the announced Noise key and its Ed25519 packet signature
+ * must verify. Copies the authenticated signing key on success. */
+bool noise_verify_announce_identity(
+    const bitchat_packet_t *packet, uint8_t out_sign_key[32]);
 void noise_poll(void);
 esp_err_t bitchat_noise_init(void);
 

@@ -17,6 +17,7 @@
 #include "bitle_stats.h"
 #include "lora_airtime.h"
 #include "lora_region.h"
+#include "lora_trunk_protocol.h"
 #include "lora_tx_scheduler.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
@@ -97,22 +98,12 @@ static const char *TAG = "bitle_lora";
 #define LORA_PREAMBLE_SYMBOLS 16
 #endif
 
-/* Trunk frame header v2 (16 bytes):
- * [0..1] magic 0xB7 0x1E   [2] version 0x02
- * [3] ftype: bit0 = ACK frame, bit1 = ack requested
- * [4..7] src node tag      [8..11] dst node tag (zeros = broadcast)
- * [12..13] packet seq BE   [14] frag idx   [15] frag total */
-#define TRUNK_MAGIC0     0xB7
-#define TRUNK_MAGIC1     0x1E
-#define TRUNK_VERSION    0x02
-#define TRUNK_HDR_LEN    16
-#define FTYPE_ACK        0x01
-#define FTYPE_ACK_REQ    0x02
-
-/* RX accepts chunks up to the wire max; TX caps chunk size well below it so
- * each frame's on-air time stays short. Short frames survive multipath fades
- * on a marginal link far more reliably than long ones. */
-#define TRUNK_CHUNK_MAX  (SX1262_MAX_PAYLOAD - TRUNK_HDR_LEN)
+/* v3 uses the portable parser/encoder in lora_trunk_protocol. RX retains the
+ * documented v2 migration path, whose shorter header permits a larger legacy
+ * chunk than v3. TX caps chunks well below either wire maximum so each frame's
+ * on-air time stays short. */
+#define TRUNK_CHUNK_RX_MAX \
+    (SX1262_MAX_PAYLOAD - LORA_TRUNK_V2_HEADER_LEN)
 #define TRUNK_CHUNK_TX   120
 #define TRUNK_MAX_FRAGS  ((BITCHAT_BLE_MAX_PACKET_SIZE + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX)
 
@@ -141,14 +132,24 @@ _Static_assert(BITCHAT_BLE_MAX_PACKET_SIZE <= LORA_TX_PACKET_MAX_LEN,
 static lora_tx_scheduler_t s_tx_scheduler;
 static TaskHandle_t s_task;
 static bool s_active;
-static uint16_t s_tx_seq;
-static uint8_t s_src_tag[4];
+static uint8_t s_node_id[LORA_TRUNK_V3_NODE_ID_LEN];
+static uint8_t s_boot_epoch[8];
+static uint32_t s_transfer_counter;
+
+typedef struct {
+    bool valid;
+    bool ack_requested;
+    uint8_t destination[LORA_TRUNK_V3_NODE_ID_LEN];
+    uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN];
+} tx_trunk_context_t;
+static tx_trunk_context_t s_tx_context[LORA_TX_PACKET_POOL_SIZE];
 
 /* Ack seen by rx_frame for the frame the ARQ machine is waiting on.
  * rx_frame runs on the lora task itself, so plain statics suffice. */
 static bool s_ack_seen;
-static uint16_t s_ack_seq;
-static uint8_t s_ack_idx;
+static bool s_expected_ack_valid;
+static lora_trunk_frame_t s_expected_ack_data;
+static lora_trunk_neighbor_table_t s_neighbors;
 
 /* Modem params (for airtime), governor, and throttle state — shared
  * between relay callers and the beacon path, guarded by a spinlock. */
@@ -272,7 +273,7 @@ static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
     for (uint8_t i = 0; i < total; ++i) {
         uint16_t off = (uint16_t)i * TRUNK_CHUNK_TX;
         uint16_t chunk = len - off < TRUNK_CHUNK_TX ? len - off : TRUNK_CHUNK_TX;
-        airtime += trunk_airtime_ms(TRUNK_HDR_LEN + chunk);
+        airtime += trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN + chunk);
     }
 
     /* Reading the clock under the lock prevents another producer from
@@ -309,13 +310,15 @@ static bool trunk_admit_locked(const uint8_t *data, uint16_t len)
 /* Reassembly of one inbound packet per remote sender (2 slots). */
 typedef struct {
     bool in_use;
-    uint8_t src[4];
-    uint16_t seq;
+    uint8_t version;
+    uint8_t src[LORA_TRUNK_V3_NODE_ID_LEN];
+    uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN];
+    uint16_t capabilities;
     uint8_t total;
     uint8_t have_mask;
     uint64_t started_ms;
     uint16_t part_len[TRUNK_MAX_FRAGS];
-    uint8_t part[TRUNK_MAX_FRAGS][TRUNK_CHUNK_MAX];
+    uint8_t part[TRUNK_MAX_FRAGS][TRUNK_CHUNK_RX_MAX];
 } rx_slot_t;
 
 #define RX_SLOTS       2
@@ -433,6 +436,7 @@ static void lora_link_cancel(uint16_t handle, uintptr_t token)
         return;
     }
     taskENTER_CRITICAL(&s_gov_mux);
+    memset(&s_tx_context[token], 0, sizeof(s_tx_context[token]));
     lora_tx_scheduler_cancel(
         &s_tx_scheduler, (lora_tx_handle_t)token);
     diag_sync_scheduler_locked();
@@ -457,7 +461,10 @@ static bitle_link_send_result_t lora_link_commit(
     uint8_t type = data[PKT_TYPE_OFF];
     lora_tx_priority_t priority = trunk_priority(type);
     lora_tx_handle_t reserved = (lora_tx_handle_t)token;
-    uint16_t sequence = 0;
+    uint32_t transfer_counter = 0;
+    uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN] = {0};
+    uint8_t destination[LORA_TRUNK_V3_NODE_ID_LEN] = {0};
+    bool ack_requested = false;
     bool committed = false;
 
     taskENTER_CRITICAL(&s_gov_mux);
@@ -477,12 +484,43 @@ static bitle_link_send_result_t lora_link_commit(
         taskEXIT_CRITICAL(&s_gov_mux);
         return BITLE_LINK_SEND_POLICY_DROPPED;
     }
-    sequence = (uint16_t)(s_tx_seq + 1);
+    transfer_counter = s_transfer_counter + 1;
+    if (transfer_counter == 0) {
+        lora_tx_scheduler_cancel(&s_tx_scheduler, reserved);
+        diag_sync_scheduler_locked();
+        taskEXIT_CRITICAL(&s_gov_mux);
+        return BITLE_LINK_SEND_FAILED;
+    }
+    lora_trunk_make_transfer_id(
+        s_boot_epoch, transfer_counter, transfer_id);
+
+    /* BitChat recipient starts immediately after the fixed 22-byte packet
+     * header. Only a fresh authenticated announce may supply a directed route;
+     * unknown routes stay reachable as unacknowledged broadcasts. */
+    if ((data[11] & 0x01u) != 0 && len >= 30) {
+        uint16_t route_capabilities = 0;
+        uint64_t now_ms = esp_timer_get_time() / 1000ULL;
+        if (lora_trunk_neighbor_route(
+                &s_neighbors, data + 22, now_ms, 180000ULL,
+                destination, &route_capabilities) &&
+            (route_capabilities & LORA_TRUNK_V3_CAP_PROTOCOL) != 0) {
+            ack_requested = true;
+        } else {
+            memset(destination, 0, sizeof(destination));
+        }
+    }
     committed = lora_tx_scheduler_commit(
-        &s_tx_scheduler, reserved, data, len, type, sequence);
+        &s_tx_scheduler, reserved, data, len, type,
+        (uint16_t)transfer_counter);
     if (committed) {
-        s_tx_seq = sequence;
+        tx_trunk_context_t *context = &s_tx_context[reserved];
+        context->valid = true;
+        context->ack_requested = ack_requested;
+        memcpy(context->destination, destination, sizeof(destination));
+        memcpy(context->transfer_id, transfer_id, sizeof(transfer_id));
+        s_transfer_counter = transfer_counter;
     } else {
+        memset(&s_tx_context[reserved], 0, sizeof(s_tx_context[reserved]));
         lora_tx_scheduler_cancel(&s_tx_scheduler, reserved);
     }
     diag_sync_scheduler_locked();
@@ -494,8 +532,10 @@ static bitle_link_send_result_t lora_link_commit(
     uint8_t total =
         (uint8_t)((len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
     ESP_LOGI(TAG,
-             "trunk accepted type=0x%02X len=%u frags=%u priority=%u seq=%u",
-             type, len, total, priority, sequence);
+             "trunk accepted type=0x%02X len=%u frags=%u priority=%u "
+             "addressed=%d transfer=%lu",
+             type, len, total, priority, ack_requested,
+             (unsigned long)transfer_counter);
     bitle_stats_note_activity(BITLE_LANE_TRUNK, 1);
     if (s_task) {
         xTaskNotifyGive(s_task);
@@ -536,9 +576,11 @@ static void tx_scheduler_release(lora_tx_handle_t handle)
         return;
     }
     taskENTER_CRITICAL(&s_gov_mux);
+    memset(&s_tx_context[handle], 0, sizeof(s_tx_context[handle]));
     lora_tx_scheduler_release(&s_tx_scheduler, handle);
     diag_sync_scheduler_locked();
     taskEXIT_CRITICAL(&s_gov_mux);
+    s_expected_ack_valid = false;
 }
 
 static bool tx_scheduler_has_queued(void)
@@ -554,7 +596,9 @@ static bool build_tx_fragment(lora_tx_handle_t handle, uint8_t idx,
 {
     const lora_tx_packet_t *packet =
         lora_tx_scheduler_packet(&s_tx_scheduler, handle);
-    if (!packet || !frame || !out_total) {
+    if (!packet || !frame || !out_total ||
+        handle >= LORA_TX_PACKET_POOL_SIZE ||
+        !s_tx_context[handle].valid) {
         return false;
     }
     uint8_t total =
@@ -562,27 +606,39 @@ static bool build_tx_fragment(lora_tx_handle_t handle, uint8_t idx,
     if (idx >= total) {
         return false;
     }
-    bool want_ack =
-        !(packet->type == BITCHAT_MSG_ANNOUNCE ||
-          packet->type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE);
     uint16_t off = (uint16_t)idx * TRUNK_CHUNK_TX;
     uint16_t remaining = packet->len - off;
     uint16_t chunk =
         remaining < TRUNK_CHUNK_TX ? remaining : TRUNK_CHUNK_TX;
-    uint8_t *header = frame->data;
-    header[0] = TRUNK_MAGIC0;
-    header[1] = TRUNK_MAGIC1;
-    header[2] = TRUNK_VERSION;
-    header[3] = want_ack ? FTYPE_ACK_REQ : 0x00;
-    memcpy(header + 4, s_src_tag, 4);
-    memset(header + 8, 0, 4);
-    header[12] = packet->sequence >> 8;
-    header[13] = packet->sequence & 0xFF;
-    header[14] = idx;
-    header[15] = total;
-    memcpy(header + TRUNK_HDR_LEN, packet->data + off, chunk);
-    frame->len = TRUNK_HDR_LEN + chunk;
-    frame->want_ack = want_ack;
+    const tx_trunk_context_t *context = &s_tx_context[handle];
+    lora_trunk_frame_t trunk = {
+        .version = LORA_TRUNK_V3_VERSION,
+        .kind = LORA_TRUNK_KIND_DATA,
+        .flags = context->ack_requested
+                     ? LORA_TRUNK_V3_FLAG_ACK_REQUESTED
+                     : LORA_TRUNK_V3_FLAG_BROADCAST,
+        .capabilities = LORA_TRUNK_V3_CAP_PROTOCOL,
+        .fragment_index = idx,
+        .fragment_total = total,
+        .payload = packet->data + off,
+        .payload_len = chunk,
+    };
+    memcpy(trunk.source, s_node_id, sizeof(trunk.source));
+    memcpy(trunk.destination, context->destination,
+           sizeof(trunk.destination));
+    memcpy(trunk.transfer_id, context->transfer_id,
+           sizeof(trunk.transfer_id));
+    size_t encoded_len = 0;
+    if (!lora_trunk_v3_encode(
+            &trunk, frame->data, sizeof(frame->data), &encoded_len)) {
+        return false;
+    }
+    frame->len = (uint16_t)encoded_len;
+    frame->want_ack = context->ack_requested;
+    s_expected_ack_valid = frame->want_ack;
+    if (s_expected_ack_valid) {
+        s_expected_ack_data = trunk;
+    }
     *out_total = total;
     return true;
 }
@@ -594,25 +650,28 @@ static bool build_tx_fragment(lora_tx_handle_t handle, uint8_t idx,
  * priority and no CAD (the peer is listening the instant its own TX ends). */
 #define ACK_OUTBOX 4
 typedef struct {
-    uint8_t dst[4];
-    uint16_t seq;
+    uint8_t version;
+    uint8_t dst[LORA_TRUNK_V3_NODE_ID_LEN];
+    uint8_t transfer_id[LORA_TRUNK_V3_TRANSFER_ID_LEN];
     uint8_t idx;
     uint8_t total;
 } ack_slot_t;
 static ack_slot_t s_ack_outbox[ACK_OUTBOX];
 static int s_ack_head, s_ack_count;
 
-static void queue_ack(const uint8_t *dst_tag, uint16_t seq, uint8_t idx, uint8_t total)
+static void queue_ack(const lora_trunk_frame_t *data)
 {
-    if (s_ack_count >= ACK_OUTBOX) {
+    if (!data || s_ack_count >= ACK_OUTBOX) {
         ESP_LOGW(TAG, "ack outbox full");
         return;
     }
     ack_slot_t *a = &s_ack_outbox[(s_ack_head + s_ack_count) % ACK_OUTBOX];
-    memcpy(a->dst, dst_tag, 4);
-    a->seq = seq;
-    a->idx = idx;
-    a->total = total;
+    memset(a, 0, sizeof(*a));
+    a->version = data->version;
+    memcpy(a->dst, data->source, sizeof(a->dst));
+    memcpy(a->transfer_id, data->transfer_id, sizeof(a->transfer_id));
+    a->idx = data->fragment_index;
+    a->total = data->fragment_total;
     s_ack_count++;
 }
 
@@ -622,70 +681,92 @@ static bool transmit_ack_now(void)
         return false;
     }
     ack_slot_t *a = &s_ack_outbox[s_ack_head];
-    uint8_t f[TRUNK_HDR_LEN];
-    f[0] = TRUNK_MAGIC0;
-    f[1] = TRUNK_MAGIC1;
-    f[2] = TRUNK_VERSION;
-    f[3] = FTYPE_ACK;
-    memcpy(f + 4, s_src_tag, 4);
-    memcpy(f + 8, a->dst, 4);
-    f[12] = a->seq >> 8;
-    f[13] = a->seq & 0xFF;
-    f[14] = a->idx;
-    f[15] = a->total;
+    uint8_t f[LORA_TRUNK_V3_HEADER_LEN] = {0};
+    size_t frame_len = 0;
+    if (a->version == LORA_TRUNK_V2_VERSION) {
+        f[0] = LORA_TRUNK_MAGIC0;
+        f[1] = LORA_TRUNK_MAGIC1;
+        f[2] = LORA_TRUNK_V2_VERSION;
+        f[3] = 0x01;
+        memcpy(f + 4, s_node_id, 4);
+        memcpy(f + 8, a->dst, 4);
+        f[12] = a->transfer_id[10];
+        f[13] = a->transfer_id[11];
+        f[14] = a->idx;
+        f[15] = a->total;
+        frame_len = LORA_TRUNK_V2_HEADER_LEN;
+    } else {
+        lora_trunk_frame_t ack = {
+            .version = LORA_TRUNK_V3_VERSION,
+            .kind = LORA_TRUNK_KIND_FRAGMENT_ACK,
+            .capabilities = LORA_TRUNK_V3_CAP_PROTOCOL,
+            .fragment_index = a->idx,
+            .fragment_total = a->total,
+        };
+        memcpy(ack.source, s_node_id, sizeof(ack.source));
+        memcpy(ack.destination, a->dst, sizeof(ack.destination));
+        memcpy(ack.transfer_id, a->transfer_id, sizeof(ack.transfer_id));
+        if (!lora_trunk_v3_encode(
+                &ack, f, sizeof(f), &frame_len)) {
+            s_ack_head = (s_ack_head + 1) % ACK_OUTBOX;
+            s_ack_count--;
+            return false;
+        }
+    }
     s_ack_head = (s_ack_head + 1) % ACK_OUTBOX;
     s_ack_count--;
-    if (sx1262_transmit(f, TRUNK_HDR_LEN) == ESP_OK) {
+    if (sx1262_transmit(f, frame_len) == ESP_OK) {
         diag_inc(&s_diag.tx_attempts);
         diag_inc(&s_diag.ack_tx);
-        ESP_LOGI(TAG, "ack TX seq=%u idx=%u", a->seq, a->idx);
+        ESP_LOGI(TAG, "v%u ack TX idx=%u", a->version, a->idx);
         return true;
     }
     recover_radio("ACK transmit command");
     return false;
 }
 
-static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
+static void learn_authenticated_neighbor(
+    const lora_trunk_frame_t *frame, const uint8_t *packet_data,
+    uint16_t packet_len, uint64_t now_ms)
 {
-    if (len < TRUNK_HDR_LEN || f[0] != TRUNK_MAGIC0 || f[1] != TRUNK_MAGIC1 ||
-        f[2] != TRUNK_VERSION) {
-        return; /* foreign traffic, noise, or old trunk version */
+    if (frame->version != LORA_TRUNK_V3_VERSION) {
+        return;
     }
-    if (memcmp(f + 4, s_src_tag, 4) == 0) {
-        return; /* our own transmission echoed */
+    bitchat_packet_t packet;
+    if (!bitchat_packet_decode(packet_data, packet_len, &packet)) {
+        return;
     }
-    diag_inc(&s_diag.raw_rx_frames);
-    ESP_LOGI(TAG, "trunk raw RX len=%u rssi=%d snr=%d ftype=0x%02X",
-             len, rssi, snr, f[3]);
-    uint16_t seq = ((uint16_t)f[12] << 8) | f[13];
-    uint8_t idx = f[14], total = f[15];
-
-    if (f[3] & FTYPE_ACK) {
-        /* Ack addressed to this node; the ARQ loop matches it by seq/idx. */
-        if (memcmp(f + 8, s_src_tag, 4) == 0) {
-            s_ack_seen = true;
-            s_ack_seq = seq;
-            s_ack_idx = idx;
-            diag_inc(&s_diag.ack_rx);
-            ESP_LOGI(TAG, "ack RX seq=%u idx=%u", seq, idx);
+    uint8_t signing_key[LORA_TRUNK_SIGNING_KEY_LEN];
+    if (memcmp(packet.sender_id, frame->source,
+               LORA_TRUNK_V3_NODE_ID_LEN) == 0 &&
+        noise_verify_announce_identity(&packet, signing_key)) {
+        uint32_t neighbor_count = 0;
+        taskENTER_CRITICAL(&s_gov_mux);
+        lora_trunk_neighbor_result_t result =
+            lora_trunk_neighbor_learn_authenticated(
+                &s_neighbors, frame->source, packet.sender_id, signing_key,
+                frame->capabilities, now_ms);
+        if (result == LORA_TRUNK_NEIGHBOR_COLLISION) {
+            s_diag.neighbor_collisions++;
         }
+        s_diag.neighbor_count =
+            (uint32_t)lora_trunk_neighbor_count(&s_neighbors);
+        neighbor_count = s_diag.neighbor_count;
+        taskEXIT_CRITICAL(&s_gov_mux);
+        ESP_LOGI(TAG, "authenticated neighbor result=%u count=%lu",
+                 result, (unsigned long)neighbor_count);
+    }
+    bitchat_packet_free(&packet);
+}
+
+static void reassemble_data(
+    const lora_trunk_frame_t *frame, int16_t rssi, int8_t snr)
+{
+    if (!frame || frame->payload_len == 0 ||
+        frame->payload_len > TRUNK_CHUNK_RX_MAX ||
+        frame->fragment_total > TRUNK_MAX_FRAGS) {
         return;
     }
-
-    /* Ack every valid ack-requested data frame, even retransmits of a
-     * packet we already completed — the sender may have missed our ack. */
-    if (f[3] & FTYPE_ACK_REQ) {
-        queue_ack(f + 4, seq, idx, total);
-    }
-
-    if (len < TRUNK_HDR_LEN + 1) {
-        return; /* no payload */
-    }
-    uint16_t chunk = len - TRUNK_HDR_LEN;
-    if (total == 0 || total > TRUNK_MAX_FRAGS || idx >= total || chunk > TRUNK_CHUNK_MAX) {
-        return;
-    }
-
     uint64_t now = esp_timer_get_time() / 1000ULL;
     rx_slot_t *slot = NULL, *free_slot = NULL, *oldest = &s_rx_slots[0];
     for (size_t i = 0; i < RX_SLOTS; ++i) {
@@ -694,7 +775,10 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
             s->in_use = false;
             diag_inc(&s_diag.reassembly_expiry);
         }
-        if (s->in_use && s->seq == seq && memcmp(s->src, f + 4, 4) == 0) {
+        if (s->in_use && s->version == frame->version &&
+            memcmp(s->src, frame->source, sizeof(s->src)) == 0 &&
+            memcmp(s->transfer_id, frame->transfer_id,
+                   sizeof(s->transfer_id)) == 0) {
             slot = s;
         } else if (!s->in_use && !free_slot) {
             free_slot = s;
@@ -707,26 +791,32 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
         slot = free_slot ? free_slot : oldest;
         memset(slot, 0, sizeof(*slot));
         slot->in_use = true;
-        memcpy(slot->src, f + 4, 4);
-        slot->seq = seq;
-        slot->total = total;
+        slot->version = frame->version;
+        memcpy(slot->src, frame->source, sizeof(slot->src));
+        memcpy(slot->transfer_id, frame->transfer_id,
+               sizeof(slot->transfer_id));
+        slot->capabilities = frame->capabilities;
+        slot->total = frame->fragment_total;
         slot->started_ms = now;
     }
-    if (slot->total != total) {
+    if (slot->total != frame->fragment_total ||
+        slot->capabilities != frame->capabilities) {
+        diag_inc(&s_diag.malformed_frames);
         return;
     }
-    slot->part_len[idx] = chunk;
-    memcpy(slot->part[idx], f + TRUNK_HDR_LEN, chunk);
-    slot->have_mask |= 1u << idx;
+    slot->part_len[frame->fragment_index] = frame->payload_len;
+    memcpy(slot->part[frame->fragment_index], frame->payload,
+           frame->payload_len);
+    slot->have_mask |= 1u << frame->fragment_index;
 
-    uint8_t want = (uint8_t)((1u << total) - 1);
+    uint8_t want = (uint8_t)((1u << frame->fragment_total) - 1);
     if ((slot->have_mask & want) != want) {
         return;
     }
 
     static uint8_t packet[BITCHAT_BLE_MAX_PACKET_SIZE];
     uint16_t plen = 0;
-    for (uint8_t i = 0; i < total; ++i) {
+    for (uint8_t i = 0; i < frame->fragment_total; ++i) {
         if (plen + slot->part_len[i] > sizeof(packet)) {
             slot->in_use = false;
             return;
@@ -736,15 +826,83 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
     }
     slot->in_use = false;
 
+    learn_authenticated_neighbor(frame, packet, plen, now);
     diag_inc(&s_diag.completed_packets);
-    ESP_LOGI(TAG, "trunk RX packet len=%u rssi=%d snr=%d frags=%u", plen, rssi, snr, total);
+    ESP_LOGI(TAG, "trunk v%u RX packet len=%u rssi=%d snr=%d frags=%u",
+             frame->version, plen, rssi, snr, frame->fragment_total);
     bitle_mesh_inbound(BITLE_LORA_LINK_HANDLE, packet, plen);
+}
+
+static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
+{
+    lora_trunk_frame_t frame;
+    lora_trunk_parse_result_t parsed = lora_trunk_parse(f, len, &frame);
+    if (parsed != LORA_TRUNK_PARSE_OK) {
+        if (parsed == LORA_TRUNK_PARSE_MALFORMED) {
+            diag_inc(&s_diag.malformed_frames);
+        } else if (parsed == LORA_TRUNK_PARSE_UNSUPPORTED_VERSION) {
+            diag_inc(&s_diag.unsupported_versions);
+        }
+        return;
+    }
+    size_t source_len =
+        frame.version == LORA_TRUNK_V2_VERSION ? 4 : sizeof(s_node_id);
+    if (memcmp(frame.source, s_node_id, source_len) == 0) {
+        return;
+    }
+
+    diag_inc(&s_diag.raw_rx_frames);
+    ESP_LOGI(TAG, "trunk v%u raw RX len=%u rssi=%d snr=%d kind=%u",
+             frame.version, len, rssi, snr, frame.kind);
+
+    if (frame.kind == LORA_TRUNK_KIND_FRAGMENT_ACK) {
+        /* v3 is the only originated version. Shared-channel ACKs for other
+         * senders are normal; only an ACK addressed to us but not matching the
+         * in-flight tuple is a rejected ACK. */
+        if (frame.version == LORA_TRUNK_V3_VERSION &&
+            memcmp(frame.destination, s_node_id, sizeof(s_node_id)) == 0) {
+            if (s_expected_ack_valid &&
+                lora_trunk_v3_ack_matches(&s_expected_ack_data, &frame)) {
+                s_ack_seen = true;
+                diag_inc(&s_diag.ack_rx);
+                ESP_LOGI(TAG, "v3 ack RX idx=%u", frame.fragment_index);
+            } else {
+                diag_inc(&s_diag.rejected_acks);
+            }
+        }
+        return;
+    }
+
+    bool broadcast =
+        frame.version == LORA_TRUNK_V3_VERSION
+            ? (frame.flags & LORA_TRUNK_V3_FLAG_BROADCAST) != 0
+            : memcmp(frame.destination,
+                     (uint8_t[LORA_TRUNK_V3_NODE_ID_LEN]){0},
+                     4) == 0;
+    size_t destination_len =
+        frame.version == LORA_TRUNK_V2_VERSION ? 4 : sizeof(s_node_id);
+    bool addressed_to_us =
+        !broadcast &&
+        memcmp(frame.destination, s_node_id, destination_len) == 0;
+    if (!broadcast && !addressed_to_us) {
+        return;
+    }
+
+    /* v3 broadcasts can never request ACKs (enforced by the parser). The v2
+     * receive-only migration path preserves legacy broadcast ACK behavior. */
+    if ((frame.flags & LORA_TRUNK_V3_FLAG_ACK_REQUESTED) != 0 &&
+        (frame.version == LORA_TRUNK_V2_VERSION || addressed_to_us)) {
+        queue_ack(&frame);
+    }
+    reassemble_data(&frame, rssi, snr);
 }
 
 /* Neighbor discovery: our signed announce over the trunk, so two nodes
  * with no phone in sight still find and verify each other. */
 #define BEACON_FIRST_MS    5000ULL
 #define BEACON_INTERVAL_MS 60000ULL
+#define BEACON_START_JITTER_MS 10000U
+#define BEACON_INTERVAL_JITTER_MS 30000U
 
 static void drop_tx_packet(lora_tx_handle_t *handle, bool *have_pending)
 {
@@ -791,7 +949,8 @@ static void lora_task(void *arg)
     unsigned ack_burst = 0;
     uint64_t tx_watchdog_deadline = 0;
     uint64_t ack_deadline = 0;
-    uint64_t next_beacon_ms = BEACON_FIRST_MS;
+    uint64_t next_beacon_ms =
+        BEACON_FIRST_MS + (esp_random() % BEACON_START_JITTER_MS);
     uint64_t next_diag_ms = 60000ULL;
 #if CONFIG_BITLE_LORA_DIAGNOSTIC_SMOKE
     static const uint16_t smoke_lengths[] = {100, 180, 300, 420, 520};
@@ -807,7 +966,10 @@ static void lora_task(void *arg)
 
         uint64_t now = esp_timer_get_time() / 1000ULL;
         if (now >= next_beacon_ms) {
-            next_beacon_ms = now + BEACON_INTERVAL_MS;
+            next_beacon_ms =
+                now + BEACON_INTERVAL_MS -
+                (BEACON_INTERVAL_JITTER_MS / 2U) +
+                (esp_random() % BEACON_INTERVAL_JITTER_MS);
             if (noise_announce_link(BITLE_LORA_LINK_HANDLE)) {
                 ESP_LOGI(TAG, "trunk beacon sent");
             }
@@ -818,20 +980,54 @@ static void lora_task(void *arg)
             now >= next_smoke_ms) {
             static uint8_t probe[BITCHAT_BLE_MAX_PACKET_SIZE];
             uint16_t probe_len = smoke_lengths[smoke_index];
-            memset(probe, 0xA5, probe_len);
-            probe[0] = 1;
-            probe[1] = BITCHAT_MSG_MESSAGE;
-            probe[2] = 0;
-            probe[11] = 0;
-            uint16_t payload_len = probe_len - 22;
-            probe[12] = payload_len >> 8;
-            probe[13] = payload_len & 0xFF;
-            memcpy(probe + PKT_SENDER_OFF, noise_get_local_peer_id(), 8);
-            ESP_LOGI(TAG, "diagnostic smoke enqueue len=%u expected_frags=%u",
-                     probe_len, (probe_len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
-            lora_link_send(BITLE_LORA_LINK_HANDLE, probe, probe_len);
-            smoke_index++;
-            next_smoke_ms = now + 12000ULL;
+            uint8_t recipient[LORA_TRUNK_V3_NODE_ID_LEN] = {0};
+            bool addressed = false;
+            taskENTER_CRITICAL(&s_gov_mux);
+            const lora_trunk_neighbor_t *freshest = NULL;
+            for (size_t i = 0; i < LORA_TRUNK_NEIGHBOR_CAPACITY; ++i) {
+                const lora_trunk_neighbor_t *entry =
+                    &s_neighbors.entries[i];
+                if (entry->in_use && !entry->quarantined &&
+                    now >= entry->last_seen_ms &&
+                    now - entry->last_seen_ms <= 180000ULL &&
+                    (!freshest ||
+                     entry->last_seen_ms > freshest->last_seen_ms)) {
+                    freshest = entry;
+                }
+            }
+            if (freshest) {
+                memcpy(recipient, freshest->reachable_peer,
+                       sizeof(recipient));
+                addressed = true;
+            }
+            taskEXIT_CRITICAL(&s_gov_mux);
+            if (!addressed) {
+                ESP_LOGI(TAG,
+                         "diagnostic smoke waiting for authenticated neighbor");
+                next_smoke_ms = now + 3000ULL;
+            } else {
+                memset(probe, 0xA5, probe_len);
+                probe[0] = 1;
+                probe[1] = BITCHAT_MSG_MESSAGE;
+                probe[2] = 0;
+                probe[11] = 0x01;
+                const uint16_t packet_header_len = 30;
+                uint16_t payload_len = probe_len - packet_header_len;
+                probe[12] = payload_len >> 8;
+                probe[13] = payload_len & 0xFF;
+                memcpy(probe + PKT_SENDER_OFF,
+                       noise_get_local_peer_id(), 8);
+                memcpy(probe + 22, recipient, sizeof(recipient));
+                ESP_LOGI(TAG,
+                         "diagnostic smoke enqueue len=%u expected_frags=%u "
+                         "addressed=1",
+                         probe_len,
+                         (probe_len + TRUNK_CHUNK_TX - 1) /
+                             TRUNK_CHUNK_TX);
+                lora_link_send(BITLE_LORA_LINK_HANDLE, probe, probe_len);
+                smoke_index++;
+                next_smoke_ms = now + 12000ULL;
+            }
         }
 #endif
 
@@ -844,7 +1040,8 @@ static void lora_task(void *arg)
                      "rx_expire=%lu complete=%lu cfg_reject=%lu radio_err=%lu "
                      "busy_tmo=%lu recover=%lu/%lu tx_watchdog=%lu "
                      "admit=%lu/%lu/%lu/%lu defer=%lu/%lu/%lu/%lu "
-                     "policy=%lu release=%lu cancel=%lu",
+                     "policy=%lu release=%lu cancel=%lu malformed=%lu "
+                     "unsupported=%lu ack_reject=%lu neighbors=%lu collision=%lu",
                      (unsigned long)diag.raw_rx_frames,
                      (unsigned long)diag.crc_errors,
                      (unsigned long)diag.tx_attempts,
@@ -875,7 +1072,12 @@ static void lora_task(void *arg)
                      (unsigned long)diag.packet_deferred[LORA_TX_PRIORITY_BULK],
                      (unsigned long)diag.policy_drops,
                      (unsigned long)diag.packet_released,
-                     (unsigned long)diag.packet_cancelled);
+                     (unsigned long)diag.packet_cancelled,
+                     (unsigned long)diag.malformed_frames,
+                     (unsigned long)diag.unsupported_versions,
+                     (unsigned long)diag.rejected_acks,
+                     (unsigned long)diag.neighbor_count,
+                     (unsigned long)diag.neighbor_collisions);
             next_diag_ms = now + 60000ULL;
         }
 
@@ -914,14 +1116,17 @@ static void lora_task(void *arg)
                      * data frame's ack wait, so extend its deadline */
                     tx_is_ack = false;
                     if (awaiting_ack) {
-                        ack_deadline += trunk_airtime_ms(TRUNK_HDR_LEN) + 300;
+                        ack_deadline +=
+                            trunk_airtime_ms(LORA_TRUNK_V3_HEADER_LEN) + 300;
                     }
                 } else if (have_pending && pending.want_ack) {
                     /* wait long enough for the peer's ack (its airtime plus
                      * CAD/scheduling slack) before retransmitting */
                     awaiting_ack = true;
                     ack_deadline = esp_timer_get_time() / 1000ULL +
-                                   trunk_airtime_ms(TRUNK_HDR_LEN) + ARQ_MARGIN_MS;
+                                   trunk_airtime_ms(
+                                       LORA_TRUNK_V3_HEADER_LEN) +
+                                   ARQ_MARGIN_MS;
                 } else {
                     have_pending = advance_tx_packet(
                         &packet_handle, &fragment_idx, fragment_total,
@@ -944,7 +1149,8 @@ static void lora_task(void *arg)
                         tx_is_ack = true;
                         tx_watchdog_deadline =
                             esp_timer_get_time() / 1000ULL +
-                            sx1262_tx_watchdog_ms(TRUNK_HDR_LEN);
+                            sx1262_tx_watchdog_ms(
+                                LORA_TRUNK_V3_HEADER_LEN);
                     }
                 } else if (have_pending) {
                     if (sx1262_transmit(pending.data, pending.len) == ESP_OK) {
@@ -1040,7 +1246,7 @@ static void lora_task(void *arg)
                 tx_is_ack = true;
                 tx_watchdog_deadline =
                     esp_timer_get_time() / 1000ULL +
-                    sx1262_tx_watchdog_ms(TRUNK_HDR_LEN);
+                    sx1262_tx_watchdog_ms(LORA_TRUNK_V3_HEADER_LEN);
             }
         }
 
@@ -1065,11 +1271,10 @@ static void lora_task(void *arg)
 
         /* ARQ: resolve the ack wait for the in-flight frame. */
         if (awaiting_ack && have_pending) {
-            uint16_t pseq = ((uint16_t)pending.data[12] << 8) | pending.data[13];
-            uint8_t pidx = pending.data[14];
             uint64_t now2 = esp_timer_get_time() / 1000ULL;
-            if (s_ack_seen && s_ack_seq == pseq && s_ack_idx == pidx) {
+            if (s_ack_seen) {
                 s_ack_seen = false;
+                s_expected_ack_valid = false;
                 awaiting_ack = false;
                 have_pending = advance_tx_packet(
                     &packet_handle, &fragment_idx, fragment_total, &pending);
@@ -1088,8 +1293,10 @@ static void lora_task(void *arg)
                     }
                 } else {
                     diag_inc(&s_diag.retry_exhaustion);
-                    ESP_LOGW(TAG, "trunk frame lost after %d sends seq=%u idx=%u",
-                             ARQ_TRIES, pseq, pidx);
+                    ESP_LOGW(TAG,
+                             "trunk frame lost after %d sends idx=%u",
+                             ARQ_TRIES,
+                             s_expected_ack_data.fragment_index);
                     drop_tx_packet(&packet_handle, &have_pending);
                 }
             }
@@ -1284,7 +1491,18 @@ esp_err_t bitle_lora_init(void)
         return ESP_OK;
     }
 
-    memcpy(s_src_tag, noise_get_local_peer_id(), sizeof(s_src_tag));
+    memcpy(s_node_id, noise_get_local_peer_id(), sizeof(s_node_id));
+    for (size_t offset = 0; offset < sizeof(s_boot_epoch);
+         offset += sizeof(uint32_t)) {
+        uint32_t random_word = esp_random();
+        memcpy(s_boot_epoch + offset, &random_word, sizeof(random_word));
+    }
+    s_transfer_counter = 0;
+    memset(s_tx_context, 0, sizeof(s_tx_context));
+    memset(s_rx_slots, 0, sizeof(s_rx_slots));
+    lora_trunk_neighbor_table_init(&s_neighbors);
+    s_expected_ack_valid = false;
+    s_ack_seen = false;
 
     /* Modem params for the airtime governor; start the bucket full so a
      * quiet node can transmit immediately. */

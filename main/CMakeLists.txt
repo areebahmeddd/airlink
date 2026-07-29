@@ -11,6 +11,7 @@ idf_component_register(
         "bitle_lora.c"
         "lora_airtime.c"
         "lora_region.c"
+        "lora_trunk_protocol.c"
         "lora_tx_scheduler.c"
         "sx1262.c"
         "bitle_ota.c"

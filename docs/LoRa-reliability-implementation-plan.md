@@ -62,7 +62,7 @@ The implementation is complete only when all of the following are true:
 | 0. Baseline harness and observability | Complete | `d130a3a` | Host baseline, both firmware targets, and two-board SF10 smoke passed |
 | 1. Airtime-safe SX1262 operation | Complete | `028511e` | Host/profile tests, both firmware targets, and SF10-SF12 two-board radio tests passed |
 | 2. Atomic packet scheduling and backpressure | Complete | `fe9e95e` | Concurrent saturation, both firmware targets, and two-board SF10 smoke passed |
-| 3. Addressed trunk protocol and migration | Pending | — | — |
+| 3. Addressed trunk protocol and migration | Complete | Pending checkpoint | v2/v3 host protocol suite, both firmware targets, and addressed two-board v3 smoke passed |
 | 4. Packet-level reliability and reassembly | Pending | — | — |
 | 5. Discovery and shared-channel behavior | Pending | — | — |
 | 6. LoRa multi-hop forwarding | Pending | — | — |
@@ -286,29 +286,29 @@ correct on a shared multi-node channel.
 
 ### Checklist
 
-- [ ] Write the trunk v3 wire-format specification before implementing it.
-- [ ] Use a sufficiently collision-resistant node identifier on the wire, or
+- [x] Write the trunk v3 wire-format specification before implementing it.
+- [x] Use a sufficiently collision-resistant node identifier on the wire, or
       define explicit collision detection and recovery for shortened tags.
-- [ ] Give each packet a reboot-safe transfer identifier that cannot be confused
+- [x] Give each packet a reboot-safe transfer identifier that cannot be confused
       with another sender's sequence.
-- [ ] Include source, destination, transfer identifier, fragment information,
+- [x] Include source, destination, transfer identifier, fragment information,
       capabilities, and integrity-covered flags in the v3 format.
-- [ ] Build a bounded neighbor table from authenticated or otherwise
+- [x] Build a bounded neighbor table from authenticated or otherwise
       integrity-checked discovery information.
-- [ ] Track which LoRa neighbor last advertised reachability for each BitChat
+- [x] Track which LoRa neighbor last advertised reachability for each BitChat
       peer so directed BitChat traffic can select a trunk destination.
-- [ ] Require addressed receivers to ACK only frames addressed to them.
-- [ ] Require senders to validate ACK source, destination, transfer identifier,
+- [x] Require addressed receivers to ACK only frames addressed to them.
+- [x] Require senders to validate ACK source, destination, transfer identifier,
       and fragment state.
-- [ ] Define broadcast behavior with no immediate all-receiver ACK storm.
-- [ ] Define behavior when the destination or route is unknown.
-- [ ] Decide and document the v2-to-v3 rollout policy:
-  - [ ] Version and capability advertisement.
-  - [ ] Mixed-firmware behavior.
-  - [ ] Whether v2 is read-only, optional fallback, or intentionally
+- [x] Define broadcast behavior with no immediate all-receiver ACK storm.
+- [x] Define behavior when the destination or route is unknown.
+- [x] Decide and document the v2-to-v3 rollout policy:
+  - [x] Version and capability advertisement.
+  - [x] Mixed-firmware behavior.
+  - [x] Whether v2 is read-only, optional fallback, or intentionally
         unsupported after migration.
-  - [ ] A rollback path for deployed nodes.
-- [ ] Add parser fuzz tests and malformed-frame tests for both supported wire
+  - [x] A rollback path for deployed nodes.
+- [x] Add parser fuzz tests and malformed-frame tests for both supported wire
       versions.
 
 ### Success criteria
@@ -323,9 +323,31 @@ correct on a shared multi-node channel.
 
 ### Milestone record
 
-- Status: Pending
+- Status: Complete
 - Evidence:
-- Commit:
+  - The written v3 specification defines a fixed 44-byte integrity-checked
+    header, full 64-bit Noise peer addressing, a 96-bit reboot-safe transfer
+    identifier, exact fragment ACK matching, broadcast-without-ACK behavior,
+    authenticated route learning, and the receive-only v2 migration policy.
+  - The allocation-free portable parser/encoder suite passes malformed v2/v3
+    cases and 100,000 deterministic fuzz frames. It also proves rejection of
+    wrong-source ACKs, isolation of identical transfer values from different
+    senders, zero ACKs for a four-node broadcast, bounded neighbor eviction,
+    expiry, and collision quarantine.
+  - ESP-IDF 6.0 builds pass for the Heltec V3 ESP32-S3 configuration and the
+    BLE-only ESP32-C3 target.
+  - A two-board SF10 test formed authenticated direct-neighbor routes on both
+    boards. All five diagnostics originated as addressed v3 traffic; 11 exact
+    fragment ACK exchanges were observed. Both nodes reported zero malformed
+    frames, unsupported versions, rejected ACKs, neighbor collisions, radio
+    timeouts, command errors, BUSY timeouts, and recovery failures.
+  - Randomized beacon startup and interval jitter was pulled forward from
+    milestone 5 because synchronized boot-time discovery was a prerequisite
+    for exercising addressed v3. The remaining shared-channel discovery and
+    loss policy stays in milestone 5.
+  - Both test boards were restored to the normal SF10 image with diagnostic
+    smoke disabled after the capture.
+- Commit: Pending checkpoint
 - Suggested commit subject: `feat(lora): introduce addressed trunk protocol v3`
 
 ## Milestone 4: Packet-level reliability and reassembly
