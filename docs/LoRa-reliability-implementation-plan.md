@@ -59,7 +59,7 @@ The implementation is complete only when all of the following are true:
 
 | Milestone | Status | Commit | Evidence summary |
 |---|---|---|---|
-| 0. Baseline harness and observability | Complete | Pending checkpoint | Host baseline, both firmware targets, and two-board SF10 smoke passed |
+| 0. Baseline harness and observability | Complete | `d130a3a` | Host baseline, both firmware targets, and two-board SF10 smoke passed |
 | 1. Airtime-safe SX1262 operation | Pending | — | — |
 | 2. Atomic packet scheduling and backpressure | Pending | — | — |
 | 3. Addressed trunk protocol and migration | Pending | — | — |
@@ -129,7 +129,7 @@ loss.
   - Runtime diagnostics now separate raw RX, CRC, TX/timeout, ACK, retry,
     queue pressure, reassembly expiry, and completed-delivery stages. Raw valid
     frames log RSSI and SNR.
-- Commit: Pending checkpoint
+- Commit: `d130a3a`
 - Suggested commit subject: `test(lora): add reliability harness and baseline telemetry`
 
 ## Milestone 1: Airtime-safe SX1262 operation
