@@ -3,6 +3,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -41,9 +42,21 @@ static const char *TAG = "bitle_lora";
  * shared channel and our own power budget regardless of relay volume. */
 #define GOV_BURST_MS   5000.0
 
-/* Wio-SX1262 on XIAO ESP32S3 (B2B connector), per the board's shipping
- * Meshtastic variant. Other targets have no default wiring. */
-#if CONFIG_IDF_TARGET_ESP32S3
+/* Board wiring for the LoRa trunk, selected via Kconfig (menuconfig →
+ * Bitle hardware → SX1262 board wiring). XIAO pins per the board's shipping
+ * Meshtastic variant; Heltec V3 pins per the MeshCore heltec_v3 variant.
+ * With no wiring selected the boot probe finds no radio and the node runs
+ * BLE-only. */
+#if CONFIG_BITLE_LORA_BOARD_HELTEC_V3
+#define LORA_PIN_SCK   9
+#define LORA_PIN_MISO  11
+#define LORA_PIN_MOSI  10
+#define LORA_PIN_CS    8
+#define LORA_PIN_RESET 12
+#define LORA_PIN_BUSY  13
+#define LORA_PIN_DIO1  14
+#define LORA_PIN_RXEN  -1  /* DIO2 keys the RF switch; no board RXEN */
+#elif CONFIG_BITLE_LORA_BOARD_XIAO_WIO_SX1262
 #define LORA_PIN_SCK   7
 #define LORA_PIN_MISO  8
 #define LORA_PIN_MOSI  9
@@ -732,6 +745,16 @@ esp_err_t bitle_lora_init(void)
             return ESP_OK;
         }
     }
+
+#if defined(CONFIG_BITLE_LORA_VEXT_PIN) && CONFIG_BITLE_LORA_VEXT_PIN >= 0
+    /* Boards like the Heltec V3 gate the radio behind a switchable
+     * peripheral rail ("Vext"); the SX1262 is inert until Vext is on. Give
+     * the rail a moment to settle before the scratch-register probe below. */
+    gpio_reset_pin(CONFIG_BITLE_LORA_VEXT_PIN);
+    gpio_set_direction(CONFIG_BITLE_LORA_VEXT_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(CONFIG_BITLE_LORA_VEXT_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+#endif
 
     if (!sx1262_detect(&cfg)) {
         ESP_LOGI(TAG, "no SX1262 radio; running BLE-only");
