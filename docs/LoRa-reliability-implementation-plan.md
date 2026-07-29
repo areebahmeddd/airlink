@@ -65,7 +65,7 @@ The implementation is complete only when all of the following are true:
 | 3. Addressed trunk protocol and migration | Complete | `3ee5843` | v2/v3 host protocol suite, both firmware targets, and addressed two-board v3 smoke passed |
 | 4. Packet-level reliability and reassembly | Complete | `33cfde3` | 99.35% sender completion at 30% data/feedback loss; five-of-five two-board transfer gate |
 | 5. Discovery and shared-channel behavior | Complete | `873eddf` | 100% simulated discovery; three-repeat two-board beacon gate passed |
-| 6. LoRa multi-hop forwarding | Pending | — | — |
+| 6. LoRa multi-hop forwarding | Complete | `21f32fd` | 198/200 lossy-line simulation; three-board forwarding/dedup smoke passed |
 | 7. Link adaptation and PHY hardening | Pending | — | — |
 | 8. End-to-end validation and rollout | Pending | — | — |
 
@@ -512,22 +512,22 @@ Turn the current one-hop LoRa bus into an actual bounded mesh backhaul.
 
 ### Checklist
 
-- [ ] Define hop-limit, deduplication, forwarding, and route-learning behavior
+- [x] Define hop-limit, deduplication, forwarding, and route-learning behavior
       for broadcast and addressed traffic.
-- [ ] Ensure a LoRa-received packet can be forwarded back onto LoRa without
+- [x] Ensure a LoRa-received packet can be forwarded back onto LoRa without
       passing through the generic link-exclusion rule that currently prevents
       it.
-- [ ] Add an expiring deduplication cache keyed by source and transfer identity.
-- [ ] Add SNR- and airtime-aware randomized forwarding delay so the strongest or
+- [x] Add an expiring deduplication cache keyed by source and transfer identity.
+- [x] Add SNR- and airtime-aware randomized forwarding delay so the strongest or
       earliest relay tends to win without synchronized rebroadcast.
-- [ ] Suppress a scheduled rebroadcast when the same packet is overheard from a
+- [x] Suppress a scheduled rebroadcast when the same packet is overheard from a
       better-positioned relay.
-- [ ] Learn reverse paths from discovery and successfully received traffic.
-- [ ] Use per-hop addressed reliability for directed forwarding.
-- [ ] Define fallback behavior when a learned route expires or fails.
-- [ ] Enforce hop limits before queue admission.
-- [ ] Keep application-level BitChat deduplication as a second safety layer.
-- [ ] Add line, triangle, ring, route-failure, node-reboot, and asymmetric-link
+- [x] Learn reverse paths from discovery and successfully received traffic.
+- [x] Use per-hop addressed reliability for directed forwarding.
+- [x] Define fallback behavior when a learned route expires or fails.
+- [x] Enforce hop limits before queue admission.
+- [x] Keep application-level BitChat deduplication as a second safety layer.
+- [x] Add line, triangle, ring, route-failure, node-reboot, and asymmetric-link
       topology tests.
 
 ### Success criteria
@@ -543,9 +543,41 @@ Turn the current one-hop LoRa bus into an actual bounded mesh backhaul.
 
 ### Milestone record
 
-- Status: Pending
+- Status: Complete
 - Evidence:
-- Commit:
+  - The v3 specification now defines immediate-hop outer identities, a default
+    relay limit of three with a hard maximum of four, fresh per-hop transfer
+    IDs, signed reverse-path learning, addressed selective-repeat forwarding,
+    and broadcast fallback after route expiry or terminal next-hop failure.
+  - The generic link registry retains ordinary ingress exclusion but exposes an
+    explicit same-medium relay callback. LoRa uses it to admit a complete
+    packet atomically back onto LoRa, preserving application TTL and the
+    existing BitChat mesh dedup as an independent second layer.
+  - A 32-entry, five-minute cache keys logical packets by BitChat source and a
+    TTL-independent fingerprint. Broadcast relays use SNR- and airtime-scaled
+    randomized delay; an overheard matching copy cancels a queued relay.
+    Forwarding, suppression, network-duplicate, hop-limit, and route-failure
+    counters are included in the hardware capture summary.
+  - The portable suite passes 27 Python/C tests. The seeded three-node line
+    delivered 198 of 200 packets across two hops with 20% independent per-hop
+    loss and four bounded attempts. Triangle delivery occurred once with two
+    duplicate paths suppressed in five processed events; the four-node ring
+    delivered once per receiver and terminated after nine events. Route
+    failure, stale-state release, reboot recovery, asymmetric links, malicious
+    repeats, cache expiry/eviction, and hop exhaustion also pass.
+  - Clean ESP-IDF 6.0 builds pass for the Heltec V3 ESP32-S3 configuration and
+    the BLE-only ESP32-C3 target.
+  - A controlled three-board SF10 same-room run emitted three distinct
+    broadcast probes from one diagnostic node. A receiver completed all three
+    hop-zero packets and transmitted three hop-one relays; the origin recorded
+    and suppressed the returned logical duplicate. All nodes reported zero
+    radio timeouts, command errors, BUSY timeouts, watchdog recoveries, and
+    recovery failures, with no queue-full events. The boards were restored to
+    the production-default image with diagnostic traffic disabled.
+  - The hardware run was a same-room triangle, not an RF-isolated physical
+    line. Milestone 8 retains the three-node endpoint-isolated hardware test;
+    the deterministic loss model is the reproducible Milestone 6 line gate.
+- Commit: `21f32fd`
 - Suggested commit subject: `feat(lora): add bounded multi-hop forwarding`
 
 ## Milestone 7: Link adaptation and PHY hardening
