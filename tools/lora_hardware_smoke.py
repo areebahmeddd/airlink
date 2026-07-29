@@ -17,10 +17,28 @@ import serial
 PACKET_RE = re.compile(r"trunk RX packet len=(\d+).*frags=(\d+)")
 RAW_RE = re.compile(r"trunk raw RX len=(\d+) rssi=(-?\d+) snr=(-?\d+)")
 TX_RE = re.compile(r"trunk TX .*len=(\d+) frags=(\d+)")
+PROFILE_RE = re.compile(r"trunk up: region=(\w+).* SF(\d+).*preamble=(\d+)")
+DIAG_RE = re.compile(
+    r"tmo=(\d+).*radio_err=(\d+).*busy_tmo=(\d+).*"
+    r"recover=(\d+)/(\d+).*tx_watchdog=(\d+)"
+)
 
 
-def reader(label: str, port: str, output: queue.Queue[tuple[str, str]], stop: threading.Event):
+def reader(
+    label: str,
+    port: str,
+    output: queue.Queue[tuple[str, str]],
+    stop: threading.Event,
+    reset: bool,
+):
     with serial.Serial(port, 115200, timeout=0.2) as stream:
+        if reset:
+            # Assert EN while keeping GPIO0 deasserted, then release EN.
+            stream.dtr = False
+            stream.rts = True
+            time.sleep(0.1)
+            stream.rts = False
+            time.sleep(0.1)
         while not stop.is_set():
             line = stream.readline().decode("utf-8", errors="replace").rstrip()
             if line:
@@ -32,20 +50,39 @@ def main() -> int:
     parser.add_argument("ports", nargs=2, help="serial ports for the two nodes")
     parser.add_argument("--seconds", type=int, default=75)
     parser.add_argument("--json-out")
+    parser.add_argument("--reset", action="store_true", help="reset both nodes at capture start")
+    parser.add_argument("--quiet", action="store_true", help="print only the JSON summary")
     args = parser.parse_args()
 
     messages: queue.Queue[tuple[str, str]] = queue.Queue()
     stop = threading.Event()
     threads = [
-        threading.Thread(target=reader, args=(f"node-{index + 1}", port, messages, stop))
+        threading.Thread(
+            target=reader,
+            args=(f"node-{index + 1}", port, messages, stop, args.reset),
+        )
         for index, port in enumerate(args.ports)
     ]
     for thread in threads:
         thread.start()
 
     summary: dict[str, dict[str, object]] = {
-        "node-1": {"rx_fragments": Counter(), "tx_fragments": Counter(), "raw": []},
-        "node-2": {"rx_fragments": Counter(), "tx_fragments": Counter(), "raw": []},
+        "node-1": {
+            "rx_fragments": Counter(),
+            "tx_fragments": Counter(),
+            "raw": [],
+            "events": Counter(),
+            "diagnostics": [],
+            "profile": None,
+        },
+        "node-2": {
+            "rx_fragments": Counter(),
+            "tx_fragments": Counter(),
+            "raw": [],
+            "events": Counter(),
+            "diagnostics": [],
+            "profile": None,
+        },
     }
     deadline = time.monotonic() + args.seconds
     try:
@@ -54,7 +91,8 @@ def main() -> int:
                 label, line = messages.get(timeout=0.25)
             except queue.Empty:
                 continue
-            print(f"[{label}] {line}")
+            if not args.quiet:
+                print(f"[{label}] {line}")
             if match := PACKET_RE.search(line):
                 summary[label]["rx_fragments"][match.group(2)] += 1
             if match := TX_RE.search(line):
@@ -67,6 +105,29 @@ def main() -> int:
                         "snr_db": int(match.group(3)),
                     }
                 )
+            if match := PROFILE_RE.search(line):
+                summary[label]["profile"] = {
+                    "region": match.group(1),
+                    "spreading_factor": int(match.group(2)),
+                    "preamble_symbols": int(match.group(3)),
+                }
+            if match := DIAG_RE.search(line):
+                summary[label]["diagnostics"].append(
+                    {
+                        "radio_timeouts": int(match.group(1)),
+                        "radio_command_errors": int(match.group(2)),
+                        "busy_timeouts": int(match.group(3)),
+                        "recoveries": int(match.group(4)),
+                        "recovery_failures": int(match.group(5)),
+                        "tx_watchdog_recoveries": int(match.group(6)),
+                    }
+                )
+            if "TX watchdog expired" in line:
+                summary[label]["events"]["tx_watchdog_expired"] += 1
+            if "radio recovered on attempt" in line:
+                summary[label]["events"]["radio_recovered"] += 1
+            if "diagnostic: suppressed one TX_DONE" in line:
+                summary[label]["events"]["tx_done_suppressed"] += 1
     finally:
         stop.set()
         for thread in threads:
@@ -77,6 +138,9 @@ def main() -> int:
             "rx_fragments": dict(values["rx_fragments"]),
             "tx_fragments": dict(values["tx_fragments"]),
             "raw": values["raw"],
+            "events": dict(values["events"]),
+            "diagnostics": values["diagnostics"],
+            "profile": values["profile"],
         }
         for label, values in summary.items()
     }

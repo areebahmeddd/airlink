@@ -60,7 +60,7 @@ The implementation is complete only when all of the following are true:
 | Milestone | Status | Commit | Evidence summary |
 |---|---|---|---|
 | 0. Baseline harness and observability | Complete | `d130a3a` | Host baseline, both firmware targets, and two-board SF10 smoke passed |
-| 1. Airtime-safe SX1262 operation | Pending | — | — |
+| 1. Airtime-safe SX1262 operation | Complete | Pending checkpoint | Host/profile tests, both firmware targets, and SF10-SF12 two-board radio tests passed |
 | 2. Atomic packet scheduling and backpressure | Pending | — | — |
 | 3. Addressed trunk protocol and migration | Pending | — | — |
 | 4. Packet-level reliability and reassembly | Pending | — | — |
@@ -141,28 +141,28 @@ for the configured frame size.
 
 ### Checklist
 
-- [ ] Replace the fixed two-second SX1262 TX timeout with a timeout derived from
+- [x] Replace the fixed two-second SX1262 TX timeout with a timeout derived from
       calculated packet airtime plus bounded scheduling and radio margin.
-- [ ] Clamp the converted SX1262 timeout to the command's valid 24-bit range.
-- [ ] Add an independent software watchdog so a missing TX interrupt still
+- [x] Clamp the converted SX1262 timeout to the command's valid 24-bit range.
+- [x] Add an independent software watchdog so a missing TX interrupt still
       recovers the radio.
-- [ ] Verify TX timeout handling distinguishes expected watchdog recovery from
+- [x] Verify TX timeout handling distinguishes expected watchdog recovery from
       an RF delivery failure.
-- [ ] Propagate and check errors from radio configuration commands instead of
+- [x] Propagate and check errors from radio configuration commands instead of
       silently continuing after failed SPI operations.
-- [ ] Add BUSY-stuck recovery and a bounded radio reinitialization path.
-- [ ] Make preamble length a profile parameter and set the robust default to at
+- [x] Add BUSY-stuck recovery and a bounded radio reinitialization path.
+- [x] Make preamble length a profile parameter and set the robust default to at
       least 16 symbols.
-- [ ] Apply the Heltec-compatible boosted RX gain setting and verify that it is
+- [x] Apply the Heltec-compatible boosted RX gain setting and verify that it is
       retained across radio mode changes.
-- [ ] Explicitly configure and verify the PA current limit needed by each
+- [x] Explicitly configure and verify the PA current limit needed by each
       supported board and TX power.
-- [ ] Introduce explicit regional profiles, initially EU868 and US915.
-- [ ] Select image calibration bytes from the active regional frequency rather
+- [x] Introduce explicit regional profiles, initially EU868 and US915.
+- [x] Select image calibration bytes from the active regional frequency rather
       than hardcoding the US band.
-- [ ] Reject invalid persisted combinations instead of silently mixing a
+- [x] Reject invalid persisted combinations instead of silently mixing a
       frequency with the wrong calibration or profile.
-- [ ] Add airtime and timeout tests for minimum, typical, and maximum frames at
+- [x] Add airtime and timeout tests for minimum, typical, and maximum frames at
       SF7 through SF12.
 
 ### Success criteria
@@ -177,9 +177,24 @@ for the configured frame size.
 
 ### Milestone record
 
-- Status: Pending
+- Status: Complete
 - Evidence:
-- Commit:
+  - Portable C tests cover 16-, 136-, and 255-byte frames at SF7 through SF12,
+    exact timeout margins, 24-bit SX1262 timeout conversion/clamping, and
+    US915/EU868 frequency, inference, mismatch, and calibration behavior.
+  - ESP-IDF 6.0 builds pass for the Heltec V3 ESP32-S3 configuration and the
+    BLE-only ESP32-C3 target.
+  - Two-board captures at SF10, SF11, and SF12 used the robust 16-symbol
+    preamble and received maximum 136-byte trunk frames at every profile.
+    Both radios reported zero SX1262 timeouts, command errors, and BUSY
+    timeouts at all three spreading factors.
+  - At every tested spreading factor, deliberately suppressing one TX_DONE
+    produced exactly one software-watchdog expiry and one successful bounded
+    radio recovery, with zero recovery failures and continued frame exchange.
+  - Radio initialization now verifies boosted RX gain and the 140 mA PA
+    over-current setting by register readback. Receive gain is rechecked every
+    time continuous RX is resumed.
+- Commit: Pending checkpoint
 - Suggested commit subject: `fix(lora): make SX1262 operation airtime safe`
 
 ## Milestone 2: Atomic packet scheduling and backpressure

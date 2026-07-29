@@ -25,6 +25,17 @@ bool lora_airtime_params_valid(const lora_airtime_params_t *params);
 /* Returns rounded milliseconds, or 0 for invalid parameters/payloads. */
 uint32_t lora_airtime_ms(const lora_airtime_params_t *params, uint16_t payload_len);
 
+/* Derive a radio timeout from airtime plus the larger of a fixed or percentage
+ * margin. Returns zero for invalid inputs. */
+uint32_t lora_tx_timeout_ms(const lora_airtime_params_t *params,
+                            uint16_t payload_len,
+                            uint32_t minimum_margin_ms,
+                            uint8_t margin_percent);
+
+/* SX126x timeout commands use 15.625 us units in a 24-bit field. */
+#define LORA_SX126X_TIMEOUT_UNITS_MAX 0xFFFFFFu
+uint32_t lora_sx126x_timeout_units(uint32_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

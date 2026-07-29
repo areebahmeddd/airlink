@@ -46,6 +46,12 @@ typedef struct {
     uint32_t completed_packets;
     uint32_t queue_depth;
     uint32_t queue_high_water;
+    uint32_t config_rejections;
+    uint32_t radio_command_errors;
+    uint32_t radio_busy_timeouts;
+    uint32_t radio_recoveries;
+    uint32_t radio_recovery_failures;
+    uint32_t tx_watchdog_recoveries;
 } bitle_lora_diag_t;
 
 /* Snapshot transport diagnostics. All counters are monotonic for the boot.

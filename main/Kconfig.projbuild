@@ -79,4 +79,37 @@ menu "Bitle hardware"
             with this enabled and leave receiving nodes on the normal build.
             Never enable it in deployed firmware.
 
+    choice BITLE_LORA_REGION
+        prompt "Default LoRa regional profile"
+        depends on IDF_TARGET_ESP32S3
+        default BITLE_LORA_REGION_US915
+
+        config BITLE_LORA_REGION_US915
+            bool "US915 (902-928 MHz)"
+
+        config BITLE_LORA_REGION_EU868
+            bool "EU868 (863-870 MHz)"
+    endchoice
+
+    config BITLE_LORA_DEFAULT_SF
+        int "Default LoRa spreading factor"
+        depends on IDF_TARGET_ESP32S3
+        range 7 12
+        default 10
+
+    config BITLE_LORA_PREAMBLE_SYMBOLS
+        int "LoRa preamble symbols"
+        depends on IDF_TARGET_ESP32S3
+        range 8 64
+        default 16
+
+    config BITLE_LORA_DIAGNOSTIC_SUPPRESS_TX_DONE_ONCE
+        bool "Suppress one TX_DONE event to exercise recovery"
+        depends on BITLE_LORA_DIAGNOSTIC_SMOKE
+        default n
+        help
+            Test-only fault injection. The LoRa task ignores its first TX_DONE
+            event so the independent software watchdog must reset the radio and
+            return it to continuous RX. Never enable it in deployed firmware.
+
 endmenu

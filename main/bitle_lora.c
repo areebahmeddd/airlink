@@ -17,6 +17,7 @@
 #include "bitle_mesh.h"
 #include "bitle_stats.h"
 #include "lora_airtime.h"
+#include "lora_region.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
 #include "sx1262.h"
@@ -78,6 +79,24 @@ static const char *TAG = "bitle_lora";
 #define LORA_PIN_RXEN  -1
 #endif
 
+#if defined(CONFIG_BITLE_LORA_REGION_EU868) && CONFIG_BITLE_LORA_REGION_EU868
+#define LORA_DEFAULT_REGION LORA_REGION_EU868
+#else
+#define LORA_DEFAULT_REGION LORA_REGION_US915
+#endif
+
+#ifdef CONFIG_BITLE_LORA_DEFAULT_SF
+#define LORA_DEFAULT_SF CONFIG_BITLE_LORA_DEFAULT_SF
+#else
+#define LORA_DEFAULT_SF 10
+#endif
+
+#ifdef CONFIG_BITLE_LORA_PREAMBLE_SYMBOLS
+#define LORA_PREAMBLE_SYMBOLS CONFIG_BITLE_LORA_PREAMBLE_SYMBOLS
+#else
+#define LORA_PREAMBLE_SYMBOLS 16
+#endif
+
 /* Trunk frame header v2 (16 bytes):
  * [0..1] magic 0xB7 0x1E   [2] version 0x02
  * [3] ftype: bit0 = ACK frame, bit1 = ack requested
@@ -133,6 +152,7 @@ static uint8_t s_ack_idx;
 static uint8_t s_sf;
 static uint32_t s_bw;
 static uint8_t s_cr;             /* denominator 5..8 => 4/5..4/8 */
+static uint16_t s_preamble_symbols;
 static bool s_ota_over_trunk;    /* OTA image chunks on the trunk (default off) */
 static bitle_lora_diag_t s_diag;
 
@@ -155,7 +175,7 @@ static uint32_t trunk_airtime_ms(uint16_t payload_len)
         .spreading_factor = s_sf,
         .bandwidth_hz = s_bw,
         .coding_rate = s_cr,
-        .preamble_symbols = 8,
+        .preamble_symbols = s_preamble_symbols,
         .explicit_header = true,
         .crc_enabled = true,
     };
@@ -308,6 +328,28 @@ static void IRAM_ATTR dio1_isr(void *arg)
     portYIELD_FROM_ISR(woken);
 }
 
+static bool recover_radio(const char *reason)
+{
+    ESP_LOGW(TAG, "radio recovery requested: %s", reason);
+    esp_err_t err = sx1262_recover();
+    if (err == ESP_OK) {
+        return true;
+    }
+    s_active = false;
+    ESP_LOGE(TAG, "radio recovery failed: %s", esp_err_to_name(err));
+    return false;
+}
+
+static bool resume_rx_or_recover(const char *reason)
+{
+    esp_err_t err = sx1262_resume_rx();
+    if (err == ESP_OK) {
+        return true;
+    }
+    ESP_LOGW(TAG, "resume RX failed: %s", esp_err_to_name(err));
+    return recover_radio(reason);
+}
+
 /* True length of the self-describing BitChat packet, dropping any trailing
  * MessagePadding (phones pad handshakes/DMs to 256 B for BLE traffic-analysis
  * resistance — a pure BLE-MTU artifact that just bloats scarce LoRa airtime).
@@ -450,7 +492,7 @@ static bool transmit_ack_now(void)
         ESP_LOGI(TAG, "ack TX seq=%u idx=%u", a->seq, a->idx);
         return true;
     }
-    sx1262_resume_rx();
+    recover_radio("ACK transmit command");
     return false;
 }
 
@@ -566,6 +608,7 @@ static void lora_task(void *arg)
     bool tx_is_ack = false;
     bool awaiting_cad = false;
     bool awaiting_ack = false;
+    uint64_t tx_watchdog_deadline = 0;
     uint64_t ack_deadline = 0;
     uint64_t next_beacon_ms = BEACON_FIRST_MS;
     uint64_t next_diag_ms = 60000ULL;
@@ -573,6 +616,9 @@ static void lora_task(void *arg)
     static const uint16_t smoke_lengths[] = {100, 180, 300, 420, 520};
     size_t smoke_index = 0;
     uint64_t next_smoke_ms = 12000ULL;
+#endif
+#if CONFIG_BITLE_LORA_DIAGNOSTIC_SUPPRESS_TX_DONE_ONCE
+    bool suppressed_tx_done = false;
 #endif
 
     while (true) {
@@ -614,7 +660,8 @@ static void lora_task(void *arg)
             ESP_LOGI(TAG,
                      "diag raw_rx=%lu crc=%lu tx=%lu tmo=%lu ack_rx=%lu ack_tx=%lu "
                      "ack_miss=%lu retry=%lu exhausted=%lu q_full=%lu q=%lu/%lu "
-                     "rx_expire=%lu complete=%lu",
+                     "rx_expire=%lu complete=%lu cfg_reject=%lu radio_err=%lu "
+                     "busy_tmo=%lu recover=%lu/%lu tx_watchdog=%lu",
                      (unsigned long)diag.raw_rx_frames,
                      (unsigned long)diag.crc_errors,
                      (unsigned long)diag.tx_attempts,
@@ -628,7 +675,13 @@ static void lora_task(void *arg)
                      (unsigned long)diag.queue_depth,
                      (unsigned long)diag.queue_high_water,
                      (unsigned long)diag.reassembly_expiry,
-                     (unsigned long)diag.completed_packets);
+                     (unsigned long)diag.completed_packets,
+                     (unsigned long)diag.config_rejections,
+                     (unsigned long)diag.radio_command_errors,
+                     (unsigned long)diag.radio_busy_timeouts,
+                     (unsigned long)diag.radio_recoveries,
+                     (unsigned long)diag.radio_recovery_failures,
+                     (unsigned long)diag.tx_watchdog_recoveries);
             next_diag_ms = now + 60000ULL;
         }
 
@@ -646,8 +699,16 @@ static void lora_task(void *arg)
                 break;
             }
             case SX1262_EVT_TX_DONE:
+#if CONFIG_BITLE_LORA_DIAGNOSTIC_SUPPRESS_TX_DONE_ONCE
+                if (!suppressed_tx_done) {
+                    suppressed_tx_done = true;
+                    ESP_LOGW(TAG, "diagnostic: suppressed one TX_DONE event");
+                    break;
+                }
+#endif
                 awaiting_tx_done = false;
-                sx1262_resume_rx();
+                tx_watchdog_deadline = 0;
+                resume_rx_or_recover("TX_DONE resume RX");
                 if (tx_is_ack) {
                     /* our ack went out; the interleave delayed any pending
                      * data frame's ack wait, so extend its deadline */
@@ -672,6 +733,9 @@ static void lora_task(void *arg)
                     if (transmit_ack_now()) {
                         awaiting_tx_done = true;
                         tx_is_ack = true;
+                        tx_watchdog_deadline =
+                            esp_timer_get_time() / 1000ULL +
+                            sx1262_tx_watchdog_ms(TRUNK_HDR_LEN);
                     }
                 } else if (have_pending) {
                     if (sx1262_transmit(pending.data, pending.len) == ESP_OK) {
@@ -680,10 +744,14 @@ static void lora_task(void *arg)
                             diag_inc(&s_diag.retries);
                         }
                         awaiting_tx_done = true;
+                        tx_is_ack = false;
+                        tx_watchdog_deadline =
+                            esp_timer_get_time() / 1000ULL +
+                            sx1262_tx_watchdog_ms(pending.len);
                         arq_sends++;
                     } else {
                         have_pending = false;
-                        sx1262_resume_rx();
+                        recover_radio("data transmit command");
                     }
                 }
                 break;
@@ -694,25 +762,45 @@ static void lora_task(void *arg)
                                              (esp_random() % CAD_BACKOFF_SPAN)));
                     if (sx1262_start_cad() == ESP_OK) {
                         awaiting_cad = true;
+                    } else {
+                        have_pending = false;
+                        recover_radio("CAD retry command");
                     }
                 } else {
                     /* channel persistently busy: drop the frame */
                     have_pending = false;
-                    sx1262_resume_rx();
+                    resume_rx_or_recover("CAD busy resume RX");
                 }
                 break;
             case SX1262_EVT_TIMEOUT:
                 diag_inc(&s_diag.tx_timeouts);
                 awaiting_tx_done = false;
-                have_pending = false;
+                tx_watchdog_deadline = 0;
+                tx_is_ack = false;
                 awaiting_ack = false;
-                sx1262_resume_rx();
+                /* A radio timeout is an expected, separately counted delivery
+                 * failure. Re-enter RX and let an ack-requested data frame use
+                 * its remaining ARQ attempts. */
+                resume_rx_or_recover("radio TX timeout");
+                if (!have_pending || !pending.want_ack || arq_sends >= ARQ_TRIES) {
+                    have_pending = false;
+                }
                 break;
             case SX1262_EVT_RX_CRC_ERROR:
                 diag_inc(&s_diag.crc_errors);
                 /* Logged for link-quality visibility: a frame arrived but
                  * was corrupted in flight. */
                 ESP_LOGI(TAG, "trunk RX CRC error");
+                break;
+            case SX1262_EVT_ERROR:
+                awaiting_tx_done = false;
+                awaiting_cad = false;
+                awaiting_ack = false;
+                tx_is_ack = false;
+                tx_watchdog_deadline = 0;
+                if (!recover_radio("IRQ status command")) {
+                    have_pending = false;
+                }
                 break;
             default:
                 break;
@@ -725,6 +813,26 @@ static void lora_task(void *arg)
             if (transmit_ack_now()) {
                 awaiting_tx_done = true;
                 tx_is_ack = true;
+                tx_watchdog_deadline =
+                    esp_timer_get_time() / 1000ULL +
+                    sx1262_tx_watchdog_ms(TRUNK_HDR_LEN);
+            }
+        }
+
+        /* Independent of DIO1 and the radio's own timeout IRQ. If TX_DONE is
+         * lost, the task must not remain permanently stuck in its TX state. */
+        uint64_t watchdog_now = esp_timer_get_time() / 1000ULL;
+        if (awaiting_tx_done && tx_watchdog_deadline != 0 &&
+            watchdog_now >= tx_watchdog_deadline) {
+            diag_inc(&s_diag.tx_watchdog_recoveries);
+            ESP_LOGW(TAG, "TX watchdog expired; resetting radio");
+            awaiting_tx_done = false;
+            awaiting_cad = false;
+            awaiting_ack = false;
+            tx_is_ack = false;
+            tx_watchdog_deadline = 0;
+            if (!recover_radio("software TX watchdog")) {
+                have_pending = false;
             }
         }
 
@@ -746,6 +854,7 @@ static void lora_task(void *arg)
                         awaiting_cad = true;   /* retransmit */
                     } else {
                         have_pending = false;
+                        recover_radio("ARQ CAD command");
                     }
                 } else {
                     diag_inc(&s_diag.retry_exhaustion);
@@ -766,6 +875,7 @@ static void lora_task(void *arg)
                 awaiting_cad = true;
             } else {
                 have_pending = false;
+                recover_radio("pending CAD command");
             }
         }
 
@@ -780,6 +890,7 @@ static void lora_task(void *arg)
                 awaiting_cad = true;
             } else {
                 have_pending = false;
+                recover_radio("dequeue CAD command");
             }
         }
     }
@@ -801,10 +912,18 @@ void bitle_lora_get_diag(bitle_lora_diag_t *out)
     if (s_tx_queue) {
         out->queue_depth = uxQueueMessagesWaiting(s_tx_queue);
     }
+    sx1262_diag_t radio_diag;
+    sx1262_get_diag(&radio_diag);
+    out->radio_command_errors = radio_diag.command_errors;
+    out->radio_busy_timeouts = radio_diag.busy_timeouts;
+    out->radio_recoveries = radio_diag.recoveries;
+    out->radio_recovery_failures = radio_diag.recovery_failures;
 }
 
 esp_err_t bitle_lora_init(void)
 {
+    const lora_region_profile_t *default_profile =
+        lora_region_profile(LORA_DEFAULT_REGION);
     sx1262_config_t cfg = {
         .pin_sck = LORA_PIN_SCK,
         .pin_miso = LORA_PIN_MISO,
@@ -814,27 +933,77 @@ esp_err_t bitle_lora_init(void)
         .pin_busy = LORA_PIN_BUSY,
         .pin_dio1 = LORA_PIN_DIO1,
         .pin_rxen = LORA_PIN_RXEN,
-        .freq_hz = 911500000,
-        .sf = 10,
+        .freq_hz = default_profile->default_hz,
+        .sf = LORA_DEFAULT_SF,
         .bw_hz = 125000,
         .cr = 5,
+        .preamble_symbols = LORA_PREAMBLE_SYMBOLS,
         .tx_dbm = 22,
+        .region = LORA_DEFAULT_REGION,
     };
 
-    /* NVS overrides (namespace "lora"): u32 freq, u8 sf, u8 enabled,
-     * u8 duty_pct (1..50, default 25), u8 ota_trunk (0/1, default 0). */
+    /* NVS overrides (namespace "lora"): u8 region, u32 freq, u8 sf,
+     * u8 enabled, u8 duty_pct (1..50, default 25), and u8 ota_trunk.
+     * A region/frequency mismatch is rejected as a pair. Legacy stores with
+     * only a frequency infer their regional profile from that frequency. */
     uint8_t duty_pct = 25;
     nvs_handle_t nvs;
     if (nvs_open("lora", NVS_READONLY, &nvs) == ESP_OK) {
         uint8_t enabled = 1;
         nvs_get_u8(nvs, "enabled", &enabled);
+
+        uint8_t stored_region = 0;
         uint32_t freq = 0;
-        if (nvs_get_u32(nvs, "freq", &freq) == ESP_OK && freq >= 902000000 && freq <= 928000000) {
-            cfg.freq_hz = freq;
+        esp_err_t region_status = nvs_get_u8(nvs, "region", &stored_region);
+        esp_err_t freq_status = nvs_get_u32(nvs, "freq", &freq);
+        bool stored_config_readable =
+            (region_status == ESP_OK || region_status == ESP_ERR_NVS_NOT_FOUND) &&
+            (freq_status == ESP_OK || freq_status == ESP_ERR_NVS_NOT_FOUND);
+        if (!stored_config_readable) {
+            diag_inc(&s_diag.config_rejections);
+            ESP_LOGE(TAG, "rejected malformed NVS LoRa region/frequency value");
+        } else if (region_status == ESP_OK && freq_status == ESP_OK) {
+            if (stored_region < LORA_REGION_COUNT &&
+                lora_region_frequency_valid((lora_region_id_t)stored_region, freq)) {
+                cfg.region = (lora_region_id_t)stored_region;
+                cfg.freq_hz = freq;
+            } else {
+                diag_inc(&s_diag.config_rejections);
+                ESP_LOGE(TAG, "rejected invalid NVS LoRa region/frequency pair");
+            }
+        } else if (region_status == ESP_OK) {
+            const lora_region_profile_t *stored_profile =
+                lora_region_profile((lora_region_id_t)stored_region);
+            if (stored_profile) {
+                cfg.region = stored_profile->id;
+                cfg.freq_hz = stored_profile->default_hz;
+            } else {
+                diag_inc(&s_diag.config_rejections);
+                ESP_LOGE(TAG, "rejected invalid NVS LoRa region");
+            }
+        } else if (freq_status == ESP_OK) {
+            lora_region_id_t inferred;
+            if (lora_region_infer(freq, &inferred)) {
+                cfg.region = inferred;
+                cfg.freq_hz = freq;
+            } else {
+                diag_inc(&s_diag.config_rejections);
+                ESP_LOGE(TAG, "rejected out-of-profile NVS LoRa frequency");
+            }
         }
+
         uint8_t sf = 0;
-        if (nvs_get_u8(nvs, "sf", &sf) == ESP_OK && sf >= 7 && sf <= 12) {
-            cfg.sf = sf;
+        esp_err_t sf_status = nvs_get_u8(nvs, "sf", &sf);
+        if (sf_status == ESP_OK) {
+            if (sf >= 7 && sf <= 12) {
+                cfg.sf = sf;
+            } else {
+                diag_inc(&s_diag.config_rejections);
+                ESP_LOGE(TAG, "rejected invalid NVS spreading factor");
+            }
+        } else if (sf_status != ESP_ERR_NVS_NOT_FOUND) {
+            diag_inc(&s_diag.config_rejections);
+            ESP_LOGE(TAG, "rejected malformed NVS spreading factor");
         }
         uint8_t d = 0;
         if (nvs_get_u8(nvs, "duty_pct", &d) == ESP_OK && d >= 1 && d <= 50) {
@@ -872,6 +1041,7 @@ esp_err_t bitle_lora_init(void)
     s_sf = cfg.sf;
     s_bw = cfg.bw_hz;
     s_cr = cfg.cr;
+    s_preamble_symbols = cfg.preamble_symbols;
     s_gov_refill_frac = duty_pct / 100.0;
     s_gov_credit_ms = GOV_BURST_MS;
     s_gov_last_ms = esp_timer_get_time() / 1000ULL;
@@ -887,13 +1057,21 @@ esp_err_t bitle_lora_init(void)
     esp_err_t err = sx1262_init(&cfg, dio1_isr, s_task);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "radio init failed: %s", esp_err_to_name(err));
+        vTaskDelete(s_task);
+        s_task = NULL;
+        vQueueDelete(s_tx_queue);
+        s_tx_queue = NULL;
         return err;
     }
 
     s_active = true;
     bitle_link_register(BITLE_LORA_LINK_HANDLE, BITLE_LINK_LORA, lora_link_send);
-    ESP_LOGI(TAG, "trunk up: %.3f MHz SF%u BW%lu +%ddBm  duty=%u%% ota_trunk=%d",
-             cfg.freq_hz / 1e6, cfg.sf, (unsigned long)cfg.bw_hz, cfg.tx_dbm,
+    const lora_region_profile_t *active_profile = lora_region_profile(cfg.region);
+    ESP_LOGI(TAG,
+             "trunk up: region=%s %.3f MHz SF%u BW%lu preamble=%u +%ddBm "
+             "duty=%u%% ota_trunk=%d",
+             active_profile->name, cfg.freq_hz / 1e6, cfg.sf,
+             (unsigned long)cfg.bw_hz, cfg.preamble_symbols, cfg.tx_dbm,
              duty_pct, s_ota_over_trunk);
     return ESP_OK;
 }
