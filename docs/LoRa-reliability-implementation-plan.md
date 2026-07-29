@@ -62,7 +62,7 @@ The implementation is complete only when all of the following are true:
 | 0. Baseline harness and observability | Complete | `d130a3a` | Host baseline, both firmware targets, and two-board SF10 smoke passed |
 | 1. Airtime-safe SX1262 operation | Complete | `028511e` | Host/profile tests, both firmware targets, and SF10-SF12 two-board radio tests passed |
 | 2. Atomic packet scheduling and backpressure | Complete | `fe9e95e` | Concurrent saturation, both firmware targets, and two-board SF10 smoke passed |
-| 3. Addressed trunk protocol and migration | Complete | Pending checkpoint | v2/v3 host protocol suite, both firmware targets, and addressed two-board v3 smoke passed |
+| 3. Addressed trunk protocol and migration | Complete | `3ee5843` | v2/v3 host protocol suite, both firmware targets, and addressed two-board v3 smoke passed |
 | 4. Packet-level reliability and reassembly | Pending | — | — |
 | 5. Discovery and shared-channel behavior | Pending | — | — |
 | 6. LoRa multi-hop forwarding | Pending | — | — |
@@ -347,7 +347,7 @@ correct on a shared multi-node channel.
     loss policy stays in milestone 5.
   - Both test boards were restored to the normal SF10 image with diagnostic
     smoke disabled after the capture.
-- Commit: Pending checkpoint
+- Commit: `3ee5843`
 - Suggested commit subject: `feat(lora): introduce addressed trunk protocol v3`
 
 ## Milestone 4: Packet-level reliability and reassembly
