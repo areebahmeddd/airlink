@@ -6,6 +6,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "bitle_route.h"
+
 static const char *TAG = "bitle_link";
 
 typedef struct {
@@ -71,6 +73,8 @@ void bitle_link_unregister(uint16_t handle)
         memset(e, 0, sizeof(*e));
     }
     xSemaphoreGive(s_lock);
+    /* Any peer-ID -> link mapping through this handle is now dangling. */
+    bitle_route_link_down(handle);
 }
 
 bool bitle_link_ready(uint16_t handle)
@@ -106,7 +110,7 @@ esp_err_t bitle_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
     return fn(handle, data, len) == 0 ? ESP_OK : ESP_FAIL;
 }
 
-int bitle_link_broadcast(uint16_t exclude_handle, const uint8_t *data, uint16_t len)
+int bitle_link_broadcast(uint16_t exclude_a, uint16_t exclude_b, const uint8_t *data, uint16_t len)
 {
     /* Snapshot under the lock, send outside it. */
     struct {
@@ -117,7 +121,7 @@ int bitle_link_broadcast(uint16_t exclude_handle, const uint8_t *data, uint16_t 
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (size_t i = 0; i < BITLE_LINK_MAX; ++i) {
-        if (s_links[i].in_use && s_links[i].handle != exclude_handle) {
+        if (s_links[i].in_use && s_links[i].handle != exclude_a && s_links[i].handle != exclude_b) {
             targets[n].handle = s_links[i].handle;
             targets[n].fn = s_links[i].send_fn;
             n++;

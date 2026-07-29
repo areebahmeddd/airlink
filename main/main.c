@@ -14,6 +14,7 @@
 #include "bitle_lora.h"
 #include "bitle_mesh.h"
 #include "bitle_ota.h"
+#include "bitle_route.h"
 #include "bitle_stats.h"
 #include "bitle_sync.h"
 #include "noise_handshake.h"
@@ -73,6 +74,7 @@ void app_main(void)
         abort();
     }
 
+    ESP_ERROR_CHECK(bitle_route_init());
     ESP_ERROR_CHECK(bitle_link_init());
     ESP_ERROR_CHECK(bitle_mesh_init());
     bitle_stats_init();

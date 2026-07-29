@@ -8,6 +8,7 @@ idf_component_register(
         "bitle_hash.c"
         "bitle_link.c"
         "bitle_mesh.c"
+        "bitle_route.c"
         "bitle_lora.c"
         "sx1262.c"
         "bitle_ota.c"

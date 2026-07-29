@@ -26,10 +26,16 @@ static const char *TAG = "bitle_lora";
  * The LoRa trunk is bandwidth-precious (default SF10/BW125 ~= 1 kbps shared,
  * whole-packet airtimes from hundreds of ms to seconds), so not everything
  * the mesh would relay over BLE belongs on it. Encoded BitChat header
- * offsets (see packet_codec): [1]=type, [2]=ttl, [14..21]=sender id. */
+ * offsets (see packet_codec): [0]=version, [1]=type, [11]=flags, sender id
+ * at [14..21] in v1 packets and [16..23] in v2 (4-byte payload length). */
 #define PKT_TYPE_OFF    1
-#define PKT_SENDER_OFF  14
+#define PKT_FLAGS_OFF   11
 #define PKT_MIN_LEN     22
+
+static size_t pkt_sender_off(uint8_t version)
+{
+    return version >= 2 ? 16 : 14;
+}
 
 /* Per-origin throttle for identity/announce floods: an announce carries no
  * time-critical content, so one per origin per interval is plenty for
@@ -94,7 +100,8 @@ static const char *TAG = "bitle_lora";
  * on a marginal link far more reliably than long ones. */
 #define TRUNK_CHUNK_MAX  (SX1262_MAX_PAYLOAD - TRUNK_HDR_LEN)
 #define TRUNK_CHUNK_TX   120
-#define TRUNK_MAX_FRAGS  ((BITCHAT_BLE_MAX_PACKET_SIZE + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX)
+/* Source-routed (v2) packets are slightly larger than the v1 BLE budget. */
+#define TRUNK_MAX_FRAGS  ((BITLE_PACKET_MAX_ROUTED + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX)
 
 /* Stop-and-wait ARQ: each ack-requested frame is retransmitted until
  * acked, ARQ_TRIES sends total. Announces are broadcast discovery and
@@ -201,6 +208,10 @@ static bool trunk_admit(const uint8_t *data, uint16_t len)
         return false;
     }
     uint8_t type = data[PKT_TYPE_OFF];
+    size_t sender_off = pkt_sender_off(data[0]);
+    if (len < sender_off + 8) {
+        return false;
+    }
     bool ota = (type >= 0xA0 && type <= 0xA3);
     bool announce = (type == BITCHAT_MSG_ANNOUNCE || type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE);
     /* Message-class traffic is user-driven, rare, and time-critical: a Noise
@@ -254,7 +265,7 @@ static bool trunk_admit(const uint8_t *data, uint16_t len)
             ESP_LOGD(TAG, "airtime budget low; deferring announce");
             return false;
         }
-        if (announce_throttled(data + PKT_SENDER_OFF, now)) {
+        if (announce_throttled(data + sender_off, now)) {
             taskEXIT_CRITICAL(&s_gov_mux);
             return false;
         }
@@ -294,22 +305,42 @@ static void IRAM_ATTR dio1_isr(void *arg)
 /* True length of the self-describing BitChat packet, dropping any trailing
  * MessagePadding (phones pad handshakes/DMs to 256 B for BLE traffic-analysis
  * resistance — a pure BLE-MTU artifact that just bloats scarce LoRa airtime).
- * Header: version|type|ttl|ts(8)|flags|payloadLen(2)|sender(8)|[recipient(8) if
- * flags&0x01]|payload|[sig(64) if flags&0x02]. Padding is appended AFTER the
- * signature, so trimming to true length never touches signed/encrypted bytes;
- * receivers read payloadLen and already accept unpadded packets. Returns len
- * unchanged if the header does not parse or claims more than we received. */
+ * Layout: version|type|ttl|ts(8)|flags|payloadLen(2 in v1, 4 in v2)|sender(8)|
+ * [recipient(8) if flags&0x01]|[route count(1)+N*8 if v2 && flags&0x08]|
+ * payload|[sig(64) if flags&0x02]. Padding is appended AFTER the signature,
+ * so trimming to true length never touches signed/encrypted bytes; receivers
+ * read payloadLen and already accept unpadded packets. Returns len unchanged
+ * if the header does not parse or claims more than we received. */
 static uint16_t trunk_true_len(const uint8_t *data, uint16_t len)
 {
     if (len < 14) {
         return len;
     }
-    uint8_t flags = data[11];
-    uint16_t payload_len = ((uint16_t)data[12] << 8) | data[13];
-    uint32_t real = 22u + payload_len;          /* header(22) + payload */
+    uint8_t version = data[0];
+    uint8_t flags = data[PKT_FLAGS_OFF];
+    uint32_t payload_len;
+    uint32_t real;
+    if (version >= 2) {
+        if (len < 16) {
+            return len;
+        }
+        payload_len = ((uint32_t)data[12] << 24) | ((uint32_t)data[13] << 16) |
+                      ((uint32_t)data[14] << 8) | data[15];
+        real = 16 + 8;                          /* v2 header + sender */
+    } else {
+        payload_len = ((uint16_t)data[12] << 8) | data[13];
+        real = 14 + 8;                          /* v1 header + sender */
+    }
     if (flags & 0x01) {
         real += 8;                              /* recipient id */
     }
+    if (version >= 2 && (flags & 0x08)) {
+        if (real >= len) {
+            return len;
+        }
+        real += 1 + (uint32_t)data[real] * 8;   /* route count + hops */
+    }
+    real += payload_len;
     if (flags & 0x02) {
         real += 64;                             /* Ed25519 signature */
     }
@@ -321,7 +352,7 @@ static uint16_t trunk_true_len(const uint8_t *data, uint16_t len)
 static int lora_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
 {
     (void)handle;
-    if (!s_active || len == 0 || len > BITCHAT_BLE_MAX_PACKET_SIZE) {
+    if (!s_active || len == 0 || len > BITLE_PACKET_MAX_ROUTED) {
         return -1;
     }
     /* Trim BLE padding before it costs LoRa airtime. */
@@ -506,7 +537,7 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
         return;
     }
 
-    static uint8_t packet[BITCHAT_BLE_MAX_PACKET_SIZE];
+    static uint8_t packet[BITLE_PACKET_MAX_ROUTED];
     uint16_t plen = 0;
     for (uint8_t i = 0; i < total; ++i) {
         if (plen + slot->part_len[i] > sizeof(packet)) {

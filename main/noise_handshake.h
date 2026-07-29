@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bitchat_ble.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -49,6 +51,17 @@ typedef enum {
     BITCHAT_NOISE_PAYLOAD_VERIFY_RESPONSE = 0x11,
 } bitchat_noise_payload_type_t;
 
+/* Upstream source routing (docs/SOURCE_ROUTING.md): a v2 packet may carry a
+ * route — an ordered list of intermediate 8-byte peer IDs, sender and final
+ * recipient excluded. Relays listed in it forward to the next hop; everyone
+ * else floods. Longer routes decode as truncated and are flooded, never
+ * dropped. */
+#define BITLE_ROUTE_MAX_HOPS 8
+
+/* Largest packet this node originates: the v1 BLE budget plus the v2
+ * length-field growth and a full-size source route. */
+#define BITLE_PACKET_MAX_ROUTED (BITCHAT_BLE_MAX_PACKET_SIZE + 2 + 1 + 8 * BITLE_ROUTE_MAX_HOPS)
+
 typedef struct {
     uint8_t version;
     uint8_t type;
@@ -59,6 +72,10 @@ typedef struct {
     bool has_recipient;
     bool is_compressed;
     bool is_rsr;               /* flag 0x10: solicited sync response replay */
+    bool has_route;            /* v2 flag 0x08: source route present */
+    bool route_truncated;      /* wire route longer than BITLE_ROUTE_MAX_HOPS */
+    uint8_t route_count;       /* valid entries in route */
+    uint8_t route[BITLE_ROUTE_MAX_HOPS][8];
     uint8_t *payload;
     uint16_t payload_len;
     uint8_t signature[64];

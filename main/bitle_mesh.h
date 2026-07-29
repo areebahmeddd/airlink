@@ -2,9 +2,12 @@
 #define BITLE_MESH_H
 
 /* Transport-agnostic mesh core: packet dispatch, fragment reassembly,
- * dedup, and TTL relay. Transports (BLE and the LoRa trunk) feed every
+ * dedup, and relay. Transports (BLE and the LoRa trunk) feed every
  * complete inbound packet here; relaying goes back out through the
- * bitle_link registry to every other ready link, regardless of medium.
+ * bitle_link registry. Forwarding mirrors the upstream BitChat relay:
+ * v2 source routes get targeted next-hop forwarding (peer IDs resolved
+ * to links via bitle_route, with flood fallback), everything else floods
+ * to every other ready link, regardless of medium.
  *
  * bitle_mesh_inbound is safe to call from multiple tasks: the whole
  * inbound path (dispatch, fragment pool, dedup ring, sync ingest, relay)

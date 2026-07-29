@@ -66,6 +66,13 @@ static uint64_t read_u64_be(const uint8_t *data, size_t len, size_t *offset, boo
     return value;
 }
 
+/* Header flag bits (upstream BinaryProtocol.Flags; 0x10 is Bitle-private). */
+#define FLAG_HAS_RECIPIENT  0x01
+#define FLAG_HAS_SIGNATURE  0x02
+#define FLAG_IS_COMPRESSED  0x04
+#define FLAG_HAS_ROUTE      0x08
+#define FLAG_IS_RSR         0x10
+
 bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *out_packet)
 {
     if (!data || !out_packet || len == 0) {
@@ -80,9 +87,22 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
     out_packet->ttl = read_u8(data, len, &offset, &ok);
     out_packet->timestamp_ms = read_u64_be(data, len, &offset, &ok);
     uint8_t flags = read_u8(data, len, &offset, &ok);
-    uint16_t payload_len = read_u16_be(data, len, &offset, &ok);
 
-    if (!ok || out_packet->version != 1) {
+    /* v1: 2-byte payload length; v2 (source routing): 4-byte payload length. */
+    uint32_t payload_len = 0;
+    if (ok && out_packet->version == 1) {
+        payload_len = read_u16_be(data, len, &offset, &ok);
+    } else if (ok && out_packet->version == 2) {
+        if (offset + 4 > len) {
+            ok = false;
+        } else {
+            payload_len = ((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16) |
+                          ((uint32_t)data[offset + 2] << 8) | data[offset + 3];
+            offset += 4;
+        }
+    }
+
+    if (!ok || (out_packet->version != 1 && out_packet->version != 2)) {
         ESP_LOGW(TAG, "Invalid packet header");
         return false;
     }
@@ -96,10 +116,10 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
 
     /* zlib-compressed payload (flag 0x04): we cannot inflate it locally, but
      * the header and raw bytes stay usable for time sync and relaying. */
-    out_packet->is_compressed = (flags & 0x04) != 0;
-    out_packet->is_rsr = (flags & 0x10) != 0;
+    out_packet->is_compressed = (flags & FLAG_IS_COMPRESSED) != 0;
+    out_packet->is_rsr = (flags & FLAG_IS_RSR) != 0;
 
-    if (flags & 0x01) {
+    if (flags & FLAG_HAS_RECIPIENT) {
         out_packet->has_recipient = true;
         if (offset + sizeof(out_packet->recipient_id) > len) {
             ESP_LOGW(TAG, "Missing recipient id bytes");
@@ -109,8 +129,37 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
         offset += 8;
     }
 
-    if (offset + payload_len > len) {
+    /* Source route (v2+, flag 0x08): 1-byte hop count + N*8 peer IDs, after
+     * recipient, before payload. Longer routes than we can store are kept
+     * marked-truncated so the relay floods instead of mis-forwarding. */
+    if (out_packet->version >= 2 && (flags & FLAG_HAS_ROUTE)) {
+        if (offset + 1 > len) {
+            ESP_LOGW(TAG, "Missing route count byte");
+            return false;
+        }
+        uint8_t count = data[offset++];
+        if (count > 0) {
+            if (offset + (size_t)count * 8 > len) {
+                ESP_LOGW(TAG, "Route bytes exceed buffer");
+                return false;
+            }
+            out_packet->has_route = true;
+            out_packet->route_count = count < BITLE_ROUTE_MAX_HOPS ? count : BITLE_ROUTE_MAX_HOPS;
+            out_packet->route_truncated = count > BITLE_ROUTE_MAX_HOPS;
+            for (uint8_t i = 0; i < out_packet->route_count; ++i) {
+                memcpy(out_packet->route[i], data + offset + (size_t)i * 8, 8);
+            }
+            offset += (size_t)count * 8;
+        }
+    }
+
+    if (payload_len > len - offset) {
         ESP_LOGW(TAG, "Payload length exceeds buffer");
+        return false;
+    }
+
+    if (payload_len > UINT16_MAX) {
+        ESP_LOGW(TAG, "Payload too large");
         return false;
     }
 
@@ -122,28 +171,34 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
         }
         memcpy(out_packet->payload, data + offset, payload_len);
     }
-    out_packet->payload_len = payload_len;
+    out_packet->payload_len = (uint16_t)payload_len;
     offset += payload_len;
 
-    /* Compressed payload (v1): [2-byte original size BE][raw deflate]. On
-     * success the packet becomes a normal one; on failure it stays marked
-     * compressed and is handled relay-only. */
-    if (out_packet->is_compressed && payload_len > 2) {
-        uint16_t original_len = ((uint16_t)out_packet->payload[0] << 8) | out_packet->payload[1];
-        if (original_len > 0) {
-            uint8_t *inflated = inflate_payload(out_packet->payload + 2, payload_len - 2, original_len);
+    /* Compressed payload: [original size BE][raw deflate], 2-byte size in v1,
+     * 4-byte in v2. On success the packet becomes a normal one; on failure it
+     * stays marked compressed and is handled relay-only. */
+    size_t size_field = out_packet->version >= 2 ? 4 : 2;
+    if (out_packet->is_compressed && payload_len > size_field) {
+        uint32_t original_len = 0;
+        for (size_t i = 0; i < size_field; ++i) {
+            original_len = (original_len << 8) | out_packet->payload[i];
+        }
+        if (original_len > 0 && original_len <= UINT16_MAX) {
+            uint8_t *inflated = inflate_payload(out_packet->payload + size_field,
+                                                payload_len - size_field, original_len);
             if (inflated) {
                 heap_caps_free(out_packet->payload);
                 out_packet->payload = inflated;
-                out_packet->payload_len = original_len;
+                out_packet->payload_len = (uint16_t)original_len;
                 out_packet->is_compressed = false;
             } else {
-                ESP_LOGW(TAG, "Failed to inflate payload (%u -> %u)", payload_len, original_len);
+                ESP_LOGW(TAG, "Failed to inflate payload (%lu -> %lu)",
+                         (unsigned long)payload_len, (unsigned long)original_len);
             }
         }
     }
 
-    if (flags & 0x02) {
+    if (flags & FLAG_HAS_SIGNATURE) {
         out_packet->has_signature = true;
         if (offset + 64 > len) {
             ESP_LOGW(TAG, "Missing signature bytes");
@@ -164,14 +219,22 @@ bool bitchat_packet_encode(const bitchat_packet_t *packet, uint8_t *out_buf, siz
     }
     size_t offset = 0;
 
-    size_t header_len = 1 /*version*/ + 1 /*type*/ + 1 /*ttl*/ + 8 /*timestamp*/ + 1 /*flags*/ + 2 /*payload len*/ + 8 /*sender*/
-                        + (packet->has_recipient ? 8 : 0);
+    /* A route forces version 2, like upstream applyRouteIfAvailable. */
+    bool routed = packet->has_route && packet->route_count > 0;
+    uint8_t version = routed && packet->version < 2 ? 2 : packet->version;
+    bool v2 = version >= 2;
+    uint8_t route_count = routed && v2 ? packet->route_count : 0;
+
+    size_t header_len = 1 /*version*/ + 1 /*type*/ + 1 /*ttl*/ + 8 /*timestamp*/ + 1 /*flags*/
+                        + (v2 ? 4 : 2) /*payload len*/ + 8 /*sender*/
+                        + (packet->has_recipient ? 8 : 0)
+                        + (route_count ? 1 + (size_t)route_count * 8 : 0);
     size_t total_len = header_len + packet->payload_len + (packet->has_signature ? 64 : 0);
     if (total_len > max_len) {
         return false;
     }
 
-    out_buf[offset++] = packet->version;
+    out_buf[offset++] = version;
     out_buf[offset++] = packet->type;
     out_buf[offset++] = packet->ttl;
 
@@ -181,16 +244,23 @@ bool bitchat_packet_encode(const bitchat_packet_t *packet, uint8_t *out_buf, siz
 
     uint8_t flags = 0;
     if (packet->has_recipient) {
-        flags |= 0x01;
+        flags |= FLAG_HAS_RECIPIENT;
     }
     if (packet->has_signature) {
-        flags |= 0x02;
+        flags |= FLAG_HAS_SIGNATURE;
+    }
+    if (route_count) {
+        flags |= FLAG_HAS_ROUTE;
     }
     if (packet->is_rsr) {
-        flags |= 0x10;
+        flags |= FLAG_IS_RSR;
     }
     out_buf[offset++] = flags;
 
+    if (v2) {
+        out_buf[offset++] = (packet->payload_len >> 24) & 0xFF;
+        out_buf[offset++] = (packet->payload_len >> 16) & 0xFF;
+    }
     out_buf[offset++] = (packet->payload_len >> 8) & 0xFF;
     out_buf[offset++] = packet->payload_len & 0xFF;
 
@@ -200,6 +270,14 @@ bool bitchat_packet_encode(const bitchat_packet_t *packet, uint8_t *out_buf, siz
     if (packet->has_recipient) {
         memcpy(out_buf + offset, packet->recipient_id, 8);
         offset += 8;
+    }
+
+    if (route_count) {
+        out_buf[offset++] = route_count;
+        for (uint8_t i = 0; i < route_count; ++i) {
+            memcpy(out_buf + offset, packet->route[i], 8);
+            offset += 8;
+        }
     }
 
     if (packet->payload_len > 0) {
@@ -279,6 +357,47 @@ bool packet_codec_self_test(void)
               memcmp(decoded.signature, packet.signature, sizeof(packet.signature)) == 0;
 
     bitchat_packet_free(&decoded);
+    if (!ok) {
+        return false;
+    }
+
+    /* v2 source-route round trip: route survives encode/decode byte-exact. */
+    bitchat_packet_t routed = {0};
+    routed.version = 2;
+    routed.type = BITCHAT_MSG_NOISE_ENCRYPTED;
+    routed.ttl = 5;
+    routed.timestamp_ms = packet.timestamp_ms;
+    memcpy(routed.sender_id, packet.sender_id, sizeof(routed.sender_id));
+    memcpy(routed.recipient_id, recipient, sizeof(routed.recipient_id));
+    routed.has_recipient = true;
+    routed.has_route = true;
+    routed.route_count = 2;
+    memcpy(routed.route[0], (uint8_t[]){0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37}, 8);
+    memcpy(routed.route[1], (uint8_t[]){0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47}, 8);
+    routed.payload = (uint8_t *)payload;
+    routed.payload_len = sizeof(payload);
+    memcpy(routed.signature, signature, sizeof(routed.signature));
+    routed.has_signature = true;
+
+    encoded_len = sizeof(encoded);
+    if (!bitchat_packet_encode(&routed, encoded, &encoded_len, sizeof(encoded))) {
+        return false;
+    }
+    bitchat_packet_t decoded_routed;
+    if (!bitchat_packet_decode(encoded, encoded_len, &decoded_routed)) {
+        return false;
+    }
+    ok = decoded_routed.version == 2 &&
+         decoded_routed.has_route && !decoded_routed.route_truncated &&
+         decoded_routed.route_count == 2 &&
+         memcmp(decoded_routed.route[0], routed.route[0], 8) == 0 &&
+         memcmp(decoded_routed.route[1], routed.route[1], 8) == 0 &&
+         decoded_routed.ttl == routed.ttl &&
+         decoded_routed.payload_len == routed.payload_len &&
+         memcmp(decoded_routed.payload, routed.payload, routed.payload_len) == 0 &&
+         decoded_routed.has_signature &&
+         memcmp(decoded_routed.signature, routed.signature, 64) == 0;
+    bitchat_packet_free(&decoded_routed);
     return ok;
 }
 

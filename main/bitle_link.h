@@ -54,9 +54,12 @@ int bitle_link_type_of(uint16_t handle);
 
 esp_err_t bitle_link_send(uint16_t handle, const uint8_t *data, uint16_t len);
 
-/* Sends to every registered link except exclude_handle (BITLE_LINK_NONE to
- * send to all). Returns the number of links the send succeeded on. */
-int bitle_link_broadcast(uint16_t exclude_handle, const uint8_t *data, uint16_t len);
+/* Sends to every registered link except the two exclusions (BITLE_LINK_NONE
+ * for "no exclusion"). The relay passes the ingress link and the link the
+ * original sender is directly connected on, so a copy never goes back
+ * toward the origin (upstream BluetoothPacketBroadcaster stage C). Returns
+ * the number of links the send succeeded on. */
+int bitle_link_broadcast(uint16_t exclude_a, uint16_t exclude_b, const uint8_t *data, uint16_t len);
 
 #ifdef __cplusplus
 }
