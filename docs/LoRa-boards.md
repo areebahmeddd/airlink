@@ -66,5 +66,16 @@ symbol there (and clear `CONFIG_BITLE_LORA_BOARD_XIAO_WIO_SX1262`), then
    `main/bitle_lora.c`. Set `LORA_PIN_RXEN` to -1 when the board has no
    GPIO-driven RX-enable (DIO2-as-RF-switch designs).
 3. Verify: build, flash, and check the boot log for
-   `bitle_lora: trunk up: ...` (success) vs `no SX1262 radio; running
-   BLE-only` (wrong pins or power gate).
+   `bitle_lora: trunk up: ... phy_verified=1` (success) vs
+   `no SX1262 radio; running BLE-only` (wrong pins or power gate). The success
+   line must identify the selected board and the expected region, frequency,
+   SF, bandwidth, coding rate, preamble, and private sync word.
+4. Run the packet-delivery and radio-recovery procedure in
+   [LoRa reliability testing](LoRa-testing.md#board-and-link-adaptation-hardware-smoke-test).
+   A successful build or SPI probe alone is not a board smoke test.
+
+At radio startup the common driver validates the complete PHY profile, reads
+back the private sync word and boosted RX-gain register, verifies the 140 mA
+over-current limit, and requires the TCXO, calibration, PA, modulation, packet,
+frequency, buffer, IRQ, and RX commands to succeed. Both board variants use
+this same verification path; only wiring and power-gate setup differ.

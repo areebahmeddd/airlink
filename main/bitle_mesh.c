@@ -362,7 +362,12 @@ static void relay_packet(uint16_t src_link, uint8_t *buffer, uint16_t len, const
     if (sender_link != BITLE_LINK_NONE && bitle_link_is_broadcast(sender_link)) {
         sender_link = BITLE_LINK_NONE;
     }
-    int forwarded = bitle_link_broadcast(src_link, sender_link, buffer, len);
+    int forwarded =
+        bitle_link_type_of(src_link) == BITLE_LINK_LORA
+            ? bitle_link_rebroadcast(
+                  src_link, sender_link, buffer, len)
+            : bitle_link_broadcast(
+                  src_link, sender_link, buffer, len);
     if (forwarded > 0) {
         bitle_stats_note_tx();
         bitle_stats_note_activity(BITLE_LANE_FWD, 1);

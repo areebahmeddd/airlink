@@ -1,0 +1,286 @@
+# BitLE LoRa trunk protocol v3
+
+## Status and scope
+
+This document defines the version 3 LoRa trunk frame used to carry encoded
+BitChat packets between BitLE nodes. Version 3 replaces the collision-prone
+four-byte v2 node tags and broadcast ACK behavior with explicit 64-bit
+addressing and exact acknowledgement matching.
+
+The SX1262 packet CRC protects the complete radio frame in transit. Version 3
+also includes a header CRC so parser-critical fields are rejected before they
+can allocate or mutate reassembly state.
+
+## Byte order and limits
+
+All multi-byte integers are unsigned and big-endian. A radio frame is at most
+255 bytes. The fixed v3 header is 44 bytes, leaving at most 211 payload bytes.
+The implementation transmits canonical 104-, 112-, or 120-byte non-final
+chunks. A receiver requires every non-final fragment in one transfer to use
+the same size and requires the final fragment to be no larger. This retains
+the existing short-frame RF behavior while allowing bounded adaptation.
+
+## Fixed header
+
+| Offset | Size | Field | Definition |
+|---:|---:|---|---|
+| 0 | 2 | magic | `B7 1E` |
+| 2 | 1 | version | `03` |
+| 3 | 1 | kind | `01` data, `02` bitmap ACK, `03` COMPLETE, `04` ABORT |
+| 4 | 1 | flags | Integrity-covered flags defined below |
+| 5 | 1 | header length | `44` |
+| 6 | 2 | capabilities | Sender capabilities |
+| 8 | 1 | hop limit | Maximum relay count; originated data defaults to `3` |
+| 9 | 1 | hop count | Relays already crossed; originated data starts at `0` |
+| 10 | 2 | payload length | Bytes following this header |
+| 12 | 8 | source | Full BitChat/Noise peer identifier |
+| 20 | 8 | destination | Full peer identifier; all zero means broadcast |
+| 28 | 12 | transfer ID | Reboot-safe identifier described below |
+| 40 | 1 | fragment value | Data index, received bitmap, full bitmap, or abort reason |
+| 41 | 1 | fragment total | `1..5` in the initial implementation |
+| 42 | 2 | header CRC | CRC-16/CCITT-FALSE of bytes `0..41` |
+
+The first implemented capability bit is `0x0001`, `TRUNK_V3`. Capability bits
+describe the sender of this frame and must not be interpreted as proof that
+another node supports a feature.
+
+### Flags
+
+- `0x01 ACK_REQUESTED`: valid only on addressed data.
+- `0x02 BROADCAST`: destination must be all zero and `ACK_REQUESTED` must be
+  clear.
+
+All other flag bits are reserved and cause the frame to be rejected. An
+addressed frame has a nonzero destination and a clear `BROADCAST` flag. A
+broadcast has a zero destination and the `BROADCAST` flag set. The redundant
+encoding makes accidental and malformed address modes detectable.
+
+Data frames require a nonzero source, nonzero transfer ID, a fragment total of
+at least one, an index below that total, and a payload length of at least one.
+The hop limit may not exceed four and the hop count may not exceed the limit.
+The legacy v3 one-hop encoding `0/0` remains valid but cannot be forwarded.
+Control frames require a nonzero source and destination, zero flags, zero
+payload, and a fragment total matching the transfer. Bitmap ACK values contain
+only bits below `fragment total`. COMPLETE contains the full received bitmap.
+ABORT uses the value byte for one of the defined reasons: retry exhaustion,
+invalid total length, resource pressure, or radio reset.
+
+## Node and transfer identity
+
+The source and destination are complete eight-byte BitChat peer IDs derived
+from Noise static public keys. For a forwarded frame they name the immediate
+LoRa sender and selected next hop, not the original BitChat sender and final
+BitChat recipient. Those end-to-end identities remain inside the encoded
+BitChat packet. Version 3 never truncates an outer node ID to the four-byte v2
+radio tag.
+
+A neighbor advertisement binds a node ID to the Ed25519 key in a successfully
+verified signed BitChat `ANNOUNCE`. The neighbor table stores that signing-key
+identity with the radio source. If the same 64-bit node ID is observed with a
+different verified signing key, every entry for that ID is quarantined and no
+direct route through the conflicting identity is selected. A later firmware
+may add an explicit collision-resolution exchange; milestone 3 fails closed.
+
+Each boot generates an unpredictable 64-bit boot epoch from the hardware random
+number generator. Every admitted per-hop packet appends a monotonically
+increasing 32-bit counter, producing a 96-bit transfer ID. The counter advances
+only when the complete packet is committed to the scheduler. A relay therefore
+creates a fresh transfer ID and selective-repeat session for its next hop.
+Reboots do not reuse the preceding boot's transfer namespace except with
+negligible random collision probability. Reassembly is keyed by the complete
+tuple `(source, transfer ID)`, so equal counters or transfer bytes from
+different senders cannot alias.
+
+## Neighbor and route learning
+
+The neighbor table is static and bounded. Entries may be created or refreshed
+only after all of the following are true:
+
+1. A complete v3 packet has been reassembled without parser errors.
+2. The encoded BitChat packet is an `ANNOUNCE`.
+3. The announce sender is derived from its advertised Noise static key.
+4. Its signature verifies with its advertised Ed25519 key.
+
+An entry records the immediate v3 source as the next hop, the signed BitChat
+peer as the reachable destination, the verified signing identity,
+capabilities, and last-seen time. If the inner announce sender equals the
+outer source, the entry is a direct radio identity. Otherwise, the verified
+announce has crossed a relay and creates a reverse path to its signed origin
+through the immediate sender. One relay may therefore advertise several
+independently signed peers without being mistaken for an identity collision.
+Expired, quarantined, or conflicting entries are not routes. The bounded table
+evicts the oldest non-quarantined entry when full.
+
+For an encoded BitChat packet with a recipient, the sender uses the freshest
+authenticated neighbor that advertised that recipient. It emits addressed v3
+data with `ACK_REQUESTED`. If there is no authenticated route, the packet is
+sent as an unacknowledged v3 broadcast so discovery or higher-level relay can
+still provide reachability. Packets without a recipient, including announces,
+are broadcasts.
+
+Discovery beacons use an independent randomized startup delay and interval
+jitter so peers booted together do not repeatedly collide. Compact beacons
+identify only the direct radio neighbor; signed announces establish usable
+direct and multi-hop BitChat routes.
+
+## Bounded forwarding
+
+The generic mesh excludes an ingress link from ordinary rebroadcasts. LoRa
+registers an explicit same-medium relay callback so a packet received from
+LoRa can be sent back onto LoRa without weakening that rule for other
+transports.
+
+Locally originated v3 data uses a hop limit of three and a hop count of zero.
+Every relay preserves the limit and increments the count before creating its
+new per-hop transfer. A receiver may admit a same-medium relay only when the
+incoming count is below the limit. Limits above four, counts above the limit,
+and exhausted relays are rejected before the whole packet is committed to the
+TX scheduler. Application TTL remains independent and is still decremented by
+the generic BitChat relay.
+
+Each node keeps a 32-entry, five-minute forwarding cache keyed by the inner
+BitChat sender and a stable 64-bit fingerprint of the encoded packet. The
+fingerprint excludes the BitChat TTL byte, so every hop recognizes the same
+logical transfer. A duplicate is acknowledged at the outer per-hop layer when
+necessary, but it is not delivered to the application or forwarded again.
+The existing 64-entry BitChat mesh dedup remains a second safety layer.
+
+Broadcast relays wait for an airtime-scaled randomized delay before CAD. Better
+SNR receives a smaller quality penalty, so a strong or early relay tends to
+transmit first. If another copy is overheard while a matching broadcast relay
+is queued or waiting, the scheduled relay is released without TX. Addressed
+forwarding uses the freshest authenticated next-hop route and the normal
+bitmap/COMPLETE per-hop reliability exchange.
+
+Authenticated routes expire after three minutes. Terminal addressed delivery
+failure removes every route using the failed next hop; a later packet falls
+back to bounded broadcast and signed-announcement forwarding can repopulate
+the path. This avoids retaining a stale route without inventing unauthenticated
+reachability from arbitrary packet headers.
+
+## Bounded link adaptation
+
+Each node keeps an allocation-free, 12-entry least-recently-used table keyed by
+the complete immediate next-hop ID. Separate fixed-point EWMAs retain RSSI,
+SNR, addressed-data completion, matched feedback success, retry fragments, and
+terminal delivery latency. Signal samples come only from accepted v3 data and
+matched controls. Delivery samples are directional: an outbound addressed
+transfer contributes exactly one success or failure when its scheduler context
+is released.
+
+The current policy bounds are:
+
+| Profile | Non-final fragment | Maximum rounds |
+|---|---:|---:|
+| unknown | 120 bytes | 8 |
+| balanced | 112 bytes | 8 |
+| weak | 104 bytes | 10 |
+| stable | 120 bytes | 6 |
+
+Two consecutive poor delivery samples select the weak policy. A delivery is
+poor when it fails, needs at least two retry fragments, has an RSSI EWMA at or
+below -115 dBm, has an SNR EWMA at or below -8 dB, or has a feedback-success
+EWMA below 70% after at least three feedback samples. Weak mode requires four
+consecutive healthy deliveries before returning to balanced.
+
+Stable mode requires at least eight delivery samples, six consecutive
+zero-retry deliveries, data success of at least 94%, retry EWMA no greater
+than 0.5, feedback success of at least 90% when enough samples exist, RSSI of
+at least -105 dBm, and SNR of at least 2 dB. One poor delivery degrades a
+stable link to balanced. An otherwise unknown link becomes balanced after four
+delivery samples. This hysteresis prevents a single marginal frame from
+oscillating the fragment contract.
+
+The selected fragment size and round ceiling are stored in the immutable
+per-transfer scheduler context. Airtime admission, feedback deadlines, retry
+deadlines, reassembly progress, and absolute lifetime are derived from that
+selection. A receiver accepts all three canonical fragment sizes, so different
+neighbors may choose different policies without a PHY compatibility change.
+
+Adaptation never changes frequency, SF, bandwidth, coding rate, sync word,
+preamble, or TX power. These parameters form a validated trunk-wide PHY
+profile. The driver verifies the private sync word and boosted RX gain by
+register readback, verifies the 140 mA over-current setting, and requires every
+PA/modulation/packet/frequency command to succeed before reporting the radio
+up. Stored region/frequency/SF values are combined with build-time parameters
+and validated as one profile; an invalid or incompatible combination falls
+back to the complete build default. There is no automatic coordinated profile
+change protocol in v3.
+
+## Packet-level reliability
+
+Only a node whose complete local ID equals an addressed data frame's
+destination may ACK it. Broadcast frames never request or produce immediate
+ACKs. Consequently four receivers of one broadcast produce zero ACK frames.
+
+An addressed sender transmits every currently missing fragment before waiting
+for feedback. A bitmap ACK reports the receiver's cumulative fragment bitmap,
+so one round trip can advance multiple fragments. The next round selectively
+retransmits only missing fragments. If every fragment is already acknowledged
+but COMPLETE was lost, the final fragment is sent as a bounded completion
+probe. A transfer uses the selected six-, eight-, or ten-round ceiling.
+
+COMPLETE is distinct from a full bitmap. The receiver sends COMPLETE only
+after all fragments are present, their combined length fits the BitChat packet
+limit, non-final fragment lengths are canonical, and the encoded BitChat
+header's exact recipient/payload/signature length equals the reassembled
+length. An incomplete or invalid packet is never reported complete.
+
+Every packet control reverses the data source and destination and copies the
+complete transfer ID and fragment total. A sender accepts a bitmap ACK,
+COMPLETE, or ABORT only when:
+
+- control source equals the selected data destination.
+- control destination equals the local data source.
+- transfer ID matches all 96 bits.
+- fragment total matches.
+
+An otherwise valid control from a different node is counted and ignored.
+
+The receiver re-ACKs duplicate fragments with its current bitmap. A bounded
+completed-transfer cache retains the source, transfer ID, fragment total, and
+expiry long enough to resend COMPLETE when the final control was lost.
+Duplicate completed transfers do not reach the BitChat mesh twice.
+
+Reassembly uses two static transfer slots and six static completed-cache
+entries. A new transfer is rejected with a resource-pressure ABORT rather than
+evicting an active transfer. Broadcast reassembly may occupy at most one slot,
+leaving one admission opportunity for addressed traffic. Each active slot has
+both a progress deadline,
+refreshed only by a new fragment, and an absolute lifetime that cannot be
+extended. Feedback wait, progress timeout, absolute lifetime, and completed
+retention are derived from the active SF, bandwidth, coding rate, preamble,
+maximum frame airtime, fragment count, selected round budget, and bounded
+contention allowance. Receiver retention uses the conservative ten-round
+ceiling because the sender policy is intentionally not encoded on air. No
+supported SF relies on a fixed ten-second timeout.
+Temporary channel occupancy does not discard an addressed transfer after a
+fixed number of CAD results: the sender returns to RX during randomized
+backoff and retries until COMPLETE, ABORT, or its absolute deadline.
+
+## Version 2 migration and rollback
+
+Version 3 nodes advertise `TRUNK_V3` in every v3 frame. They originate only v3
+frames. During the migration window they continue to parse v2 data and emit a
+v2 ACK when the legacy frame requests one, preserving inbound compatibility
+with deployed v2 senders. They do not derive v3 neighbor routes from v2 frames
+and never fall back to originating v2, because v2 has only four-byte tags and
+cannot authenticate an ACK source strongly enough for addressed delivery.
+
+The mixed-firmware behavior is therefore asymmetric:
+
+- v3 sender to v3 receiver: v3 addressed delivery after authenticated route
+  learning, otherwise v3 unacknowledged broadcast.
+- v2 sender to v3 receiver: legacy v2 receive and legacy ACK behavior.
+- v3 sender to v2 receiver: no v3 delivery; periodic announces eventually
+  expose the missing capability after that node is upgraded.
+
+This is an intentional migration tradeoff: safety is not silently downgraded
+to obtain bidirectional compatibility. Rollback consists of installing the
+last v2 firmware image. Version 3 adds no persistent NVS schema and therefore
+does not make rollback data-destructive.
+
+The v2 parser accepts only the documented 16-byte header, known flag bits,
+valid fragment bounds, a nonzero source, and a payload for data frames. Unknown
+versions, kinds, flags, inconsistent lengths, invalid identifiers, and invalid
+fragment state are rejected without allocating reassembly state.
