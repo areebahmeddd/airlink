@@ -12,6 +12,7 @@ idf_component_register(
         "lora_airtime.c"
         "lora_channel_policy.c"
         "lora_forwarding.c"
+        "lora_link_adaptation.c"
         "lora_packet_reliability.c"
         "lora_region.c"
         "lora_trunk_protocol.c"

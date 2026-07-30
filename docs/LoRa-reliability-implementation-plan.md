@@ -66,7 +66,7 @@ The implementation is complete only when all of the following are true:
 | 4. Packet-level reliability and reassembly | Complete | `33cfde3` | 99.35% sender completion at 30% data/feedback loss; five-of-five two-board transfer gate |
 | 5. Discovery and shared-channel behavior | Complete | `873eddf` | 100% simulated discovery; three-repeat two-board beacon gate passed |
 | 6. LoRa multi-hop forwarding | Complete | `21f32fd` | 198/200 lossy-line simulation; three-board forwarding/dedup smoke passed |
-| 7. Link adaptation and PHY hardening | Pending | — | — |
+| 7. Link adaptation and PHY hardening | In progress | — | Host/firmware suites and three-Heltec CR 4/5 adaptation smoke pass; XIAO, CR 4/6–4/7 RF, and instrumented power/thermal gates remain |
 | 8. End-to-end validation and rollout | Pending | — | — |
 
 ## Milestone 0: Baseline harness and observability
@@ -589,16 +589,16 @@ silently diverge onto incompatible radio parameters.
 
 ### Checklist
 
-- [ ] Maintain per-neighbor EWMA metrics for RSSI, SNR, data success, ACK
+- [x] Maintain per-neighbor EWMA metrics for RSSI, SNR, data success, ACK
       success, retries, and recent delivery latency.
-- [ ] Adapt fragment size and retry budget within documented bounds.
+- [x] Adapt fragment size and retry budget within documented bounds.
 - [ ] Evaluate CR 4/6 and 4/7 against CR 4/5 using controlled airtime and
       delivery measurements.
-- [ ] Do not change frequency, SF, bandwidth, sync word, or coding rate for one
+- [x] Do not change frequency, SF, bandwidth, sync word, or coding rate for one
       peer without an explicit coordinated profile-change protocol.
-- [ ] If coordinated profile changes are implemented, define rendezvous,
+- [x] If coordinated profile changes are implemented, define rendezvous,
       confirmation, timeout, and rollback behavior.
-- [ ] Persist only validated profile choices and recover safely from corrupt or
+- [x] Persist only validated profile choices and recover safely from corrupt or
       incompatible NVS values.
 - [ ] Verify boosted RX gain, preamble length, PA setup, and regional frequency
       on each supported board.
@@ -619,8 +619,41 @@ silently diverge onto incompatible radio parameters.
 
 ### Milestone record
 
-- Status: Pending
+- Status: In progress
 - Evidence:
+  - A bounded 12-neighbor LRU table now keeps fixed-point EWMA RSSI, SNR, data
+    and ACK success, retry count, and delivery latency without logging peer
+    identifiers. Two consecutive poor deliveries select a 104-byte,
+    ten-round weak policy; four healthy deliveries recover to a 112-byte
+    balanced policy; a stable streak with at least nine completed samples
+    restores the 120-byte, six-round throughput policy.
+  - Adaptation changes only fragment size and retry ceiling. Frequency, SF,
+    bandwidth, coding rate, preamble, sync word, and TX power remain
+    trunk-wide. No coordinated PHY-change protocol was added, so rendezvous
+    and rollback behavior are intentionally not applicable.
+  - Region/profile loading validates the complete stored profile, including
+    region/frequency compatibility and every PHY field, before applying it.
+    Malformed, partial, or incompatible state falls back atomically to the
+    complete build-time profile. Host tests cover corrupt values, legacy
+    frequency-only state, and safe fallback.
+  - The portable suite passes four C binaries and 30 Python tests, including
+    weak-link improvement, stable-link throughput recovery, bounded hysteresis,
+    LRU eviction, malformed profiles, and explicit CR 4/5, 4/6, and 4/7
+    airtime costs. Clean ESP-IDF 6.0 builds pass for ESP32-S3 and ESP32-C3.
+  - In a controlled 120-second three-Heltec SF10/125 kHz/CR 4/5 run, the
+    sender completed all 10 addressed transfers. Data and ACK success were
+    100%, retries were zero, the ninth delivery selected the stable profile,
+    and the final 480-byte recovery transfer used four 120-byte fragments with
+    a six-round ceiling. All three boards verified the configured region,
+    frequency, SF, bandwidth, coding rate, preamble, private sync word, and PHY
+    readback. Captured radio-command, BUSY, TX-timeout, watchdog, recovery, and
+    recovery-failure counters were zero. All boards were then restored to the
+    production image with diagnostic modes disabled.
+  - Milestone completion remains blocked on controlled CR 4/6 and CR 4/7 RF
+    comparisons, a physical XIAO Wio-SX1262 run of the same suite, and
+    instrumented current/temperature measurements. The attached boards are
+    Heltec V3 units, and serial telemetry cannot substitute for the required
+    power analyzer and thermal probe.
 - Commit:
 - Suggested commit subject: `feat(lora): adapt trunk behavior to measured link quality`
 

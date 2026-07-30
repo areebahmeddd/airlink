@@ -77,9 +77,23 @@ menu "Bitle hardware"
             Test-only mode. First transmit three spaced synthetic broadcasts
             that exercise same-medium forwarding, then after an authenticated
             v3 neighbor is discovered transmit addressed packets spanning one
-            through five fragments. Flash exactly one test node with this
-            enabled and leave receiving nodes on the normal build. Never enable
-            it in deployed firmware.
+            through five fragments, followed by successful recovery probes
+            that exercise balanced-to-stable link adaptation. Flash exactly
+            one test node with this enabled and leave receiving nodes on the
+            normal build. Never enable it in deployed firmware.
+
+    config BITLE_LORA_DIAGNOSTIC_QUIET
+        bool "Restrict LoRa TX to controlled diagnostic traffic"
+        depends on IDF_TARGET_ESP32S3
+        default n
+        help
+            Test-only mode for controlled PHY comparisons. Local LoRa data
+            admission guarantees one signed discovery announcement and
+            continues announcements until an authenticated neighbor is
+            learned, then limits data to marked diagnostic probes; beacons and
+            packet controls remain enabled and refresh the direct route.
+            Enable it on every board participating in a coding-rate or power
+            measurement. Never enable it in deployed firmware.
 
     choice BITLE_LORA_REGION
         prompt "Default LoRa regional profile"
@@ -98,6 +112,17 @@ menu "Bitle hardware"
         depends on IDF_TARGET_ESP32S3
         range 7 12
         default 10
+
+    config BITLE_LORA_CODING_RATE
+        int "LoRa coding-rate denominator (4/x)"
+        depends on IDF_TARGET_ESP32S3
+        range 5 8
+        default 5
+        help
+            Global interoperable PHY setting. Every node on a trunk must use
+            the same value. Link adaptation never changes coding rate for one
+            peer; coordinated CR4/6 and CR4/7 test builds may override this
+            default on every participating board.
 
     config BITLE_LORA_PREAMBLE_SYMBOLS
         int "LoRa preamble symbols"

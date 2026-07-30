@@ -54,9 +54,6 @@ static const char *TAG = "sx1262";
 #define REG_RX_GAIN       0x08AC
 #define REG_OCP           0x08E7
 
-/* Private-network sync word, distinct from Meshtastic/public (0x2444). */
-#define SYNC_MSB          0x14
-#define SYNC_LSB          0x24
 #define RX_GAIN_BOOSTED   0x96
 /* OCP is programmed in 2.5 mA steps: 0x38 = 140 mA. */
 #define OCP_140_MA        0x38
@@ -199,16 +196,24 @@ static esp_err_t chip_reset(void)
 
 static bool config_valid(const sx1262_config_t *cfg)
 {
-    return cfg &&
-           cfg->pin_sck >= 0 && cfg->pin_miso >= 0 && cfg->pin_mosi >= 0 &&
-           cfg->pin_cs >= 0 && cfg->pin_reset >= 0 && cfg->pin_busy >= 0 &&
-           cfg->pin_dio1 >= 0 &&
-           lora_region_frequency_valid(cfg->region, cfg->freq_hz) &&
-           cfg->sf >= 7 && cfg->sf <= 12 &&
-           (cfg->bw_hz == 125000 || cfg->bw_hz == 250000 || cfg->bw_hz == 500000) &&
-           cfg->cr >= 5 && cfg->cr <= 8 &&
-           cfg->preamble_symbols >= 8 &&
-           cfg->tx_dbm >= -9 && cfg->tx_dbm <= 22;
+    if (!cfg ||
+        cfg->pin_sck < 0 || cfg->pin_miso < 0 ||
+        cfg->pin_mosi < 0 || cfg->pin_cs < 0 ||
+        cfg->pin_reset < 0 || cfg->pin_busy < 0 ||
+        cfg->pin_dio1 < 0) {
+        return false;
+    }
+    lora_phy_profile_t profile = {
+        .region = cfg->region,
+        .frequency_hz = cfg->freq_hz,
+        .spreading_factor = cfg->sf,
+        .bandwidth_hz = cfg->bw_hz,
+        .coding_rate = cfg->cr,
+        .preamble_symbols = cfg->preamble_symbols,
+        .sync_word = LORA_PRIVATE_SYNC_WORD,
+        .tx_dbm = cfg->tx_dbm,
+    };
+    return lora_phy_profile_valid(&profile);
 }
 
 static esp_err_t bus_init(const sx1262_config_t *cfg)
@@ -286,6 +291,26 @@ static esp_err_t verify_reg(uint16_t address, uint8_t expected, const char *name
         s_diag.command_errors++;
         ESP_LOGE(TAG, "%s verify failed: wrote 0x%02x read 0x%02x",
                  name, expected, actual);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t verify_regs(
+    uint16_t address, const uint8_t *expected, size_t count,
+    const char *name)
+{
+    if (!expected || count == 0 || count > 4) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t actual[4] = {0};
+    esp_err_t err = read_reg(address, actual, count);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (memcmp(actual, expected, count) != 0) {
+        s_diag.command_errors++;
+        ESP_LOGE(TAG, "%s verify failed", name);
         return ESP_ERR_INVALID_RESPONSE;
     }
     return ESP_OK;
@@ -386,8 +411,13 @@ static esp_err_t configure_radio(void)
     };
     RETURN_ON_ERROR(cmd(OP_SET_MOD_PARAMS, modulation, sizeof(modulation)));
 
-    uint8_t sync[2] = {SYNC_MSB, SYNC_LSB};
+    uint8_t sync[2] = {
+        LORA_PRIVATE_SYNC_WORD >> 8,
+        LORA_PRIVATE_SYNC_WORD & 0xFF
+    };
     RETURN_ON_ERROR(write_reg(REG_LORA_SYNC_MSB, sync, sizeof(sync)));
+    RETURN_ON_ERROR(verify_regs(
+        REG_LORA_SYNC_MSB, sync, sizeof(sync), "sync word"));
 
     uint8_t rx_gain = RX_GAIN_BOOSTED;
     RETURN_ON_ERROR(write_reg(REG_RX_GAIN, &rx_gain, 1));

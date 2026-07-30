@@ -466,6 +466,13 @@ lora_trunk_neighbor_result_t lora_trunk_neighbor_learn_authenticated(
         if (same_route->quarantined) {
             return LORA_TRUNK_NEIGHBOR_COLLISION;
         }
+        /* A newly observed relayed copy must not downgrade or redirect an
+         * authenticated direct route for the same signed peer. It also must
+         * not refresh that direct route's lifetime: only another direct
+         * announcement proves that the immediate neighbor is still present. */
+        if (same_route->direct_identity && !direct_identity) {
+            return LORA_TRUNK_NEIGHBOR_REFRESHED;
+        }
         memcpy(same_route->node_id, node_id, LORA_TRUNK_V3_NODE_ID_LEN);
         same_route->direct_identity = direct_identity;
         same_route->capabilities = capabilities;

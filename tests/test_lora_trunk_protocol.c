@@ -298,6 +298,16 @@ static void test_neighbor_routes_and_collision(void)
         &table, SOURCE_A, 1500, 1000, route, &capabilities));
     assert(memcmp(route, SOURCE_A, 8) == 0);
     assert(capabilities == LORA_TRUNK_V3_CAP_PROTOCOL);
+    assert(lora_trunk_neighbor_learn_authenticated(
+               &table, SOURCE_B, SOURCE_A, key_a,
+               false, LORA_TRUNK_V3_CAP_PROTOCOL, 1600) ==
+           LORA_TRUNK_NEIGHBOR_REFRESHED);
+    assert(lora_trunk_neighbor_route(
+        &table, SOURCE_A, 1900, 1000, route, NULL));
+    assert(memcmp(route, SOURCE_A, 8) == 0);
+    assert(table.entries[0].direct_identity);
+    assert(!lora_trunk_neighbor_route(
+        &table, SOURCE_A, 2001, 1000, route, NULL));
     assert(!lora_trunk_neighbor_route(
         &table, SOURCE_A, 2501, 1000, route, NULL));
 

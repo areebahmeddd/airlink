@@ -15,8 +15,10 @@ can allocate or mutate reassembly state.
 
 All multi-byte integers are unsigned and big-endian. A radio frame is at most
 255 bytes. The fixed v3 header is 44 bytes, leaving at most 211 payload bytes.
-The initial implementation transmits chunks of at most 120 bytes to retain the
-existing short-frame RF behavior.
+The implementation transmits canonical 104-, 112-, or 120-byte non-final
+chunks. A receiver requires every non-final fragment in one transfer to use
+the same size and requires the final fragment to be no larger. This retains
+the existing short-frame RF behavior while allowing bounded adaptation.
 
 ## Fixed header
 
@@ -156,6 +158,55 @@ back to bounded broadcast and signed-announcement forwarding can repopulate
 the path. This avoids retaining a stale route without inventing unauthenticated
 reachability from arbitrary packet headers.
 
+## Bounded link adaptation
+
+Each node keeps an allocation-free, 12-entry least-recently-used table keyed by
+the complete immediate next-hop ID. Separate fixed-point EWMAs retain RSSI,
+SNR, addressed-data completion, matched feedback success, retry fragments, and
+terminal delivery latency. Signal samples come only from accepted v3 data and
+matched controls. Delivery samples are directional: an outbound addressed
+transfer contributes exactly one success or failure when its scheduler context
+is released.
+
+The current policy bounds are:
+
+| Profile | Non-final fragment | Maximum rounds |
+|---|---:|---:|
+| unknown | 120 bytes | 8 |
+| balanced | 112 bytes | 8 |
+| weak | 104 bytes | 10 |
+| stable | 120 bytes | 6 |
+
+Two consecutive poor delivery samples select the weak policy. A delivery is
+poor when it fails, needs at least two retry fragments, has an RSSI EWMA at or
+below -115 dBm, has an SNR EWMA at or below -8 dB, or has a feedback-success
+EWMA below 70% after at least three feedback samples. Weak mode requires four
+consecutive healthy deliveries before returning to balanced.
+
+Stable mode requires at least eight delivery samples, six consecutive
+zero-retry deliveries, data success of at least 94%, retry EWMA no greater
+than 0.5, feedback success of at least 90% when enough samples exist, RSSI of
+at least -105 dBm, and SNR of at least 2 dB. One poor delivery degrades a
+stable link to balanced. An otherwise unknown link becomes balanced after four
+delivery samples. This hysteresis prevents a single marginal frame from
+oscillating the fragment contract.
+
+The selected fragment size and round ceiling are stored in the immutable
+per-transfer scheduler context. Airtime admission, feedback deadlines, retry
+deadlines, reassembly progress, and absolute lifetime are derived from that
+selection. A receiver accepts all three canonical fragment sizes, so different
+neighbors may choose different policies without a PHY compatibility change.
+
+Adaptation never changes frequency, SF, bandwidth, coding rate, sync word,
+preamble, or TX power. These parameters form a validated trunk-wide PHY
+profile. The driver verifies the private sync word and boosted RX gain by
+register readback, verifies the 140 mA over-current setting, and requires every
+PA/modulation/packet/frequency command to succeed before reporting the radio
+up. Stored region/frequency/SF values are combined with build-time parameters
+and validated as one profile; an invalid or incompatible combination falls
+back to the complete build default. There is no automatic coordinated profile
+change protocol in v3.
+
 ## Packet-level reliability
 
 Only a node whose complete local ID equals an addressed data frame's
@@ -167,7 +218,7 @@ for feedback. A bitmap ACK reports the receiver's cumulative fragment bitmap,
 so one round trip can advance multiple fragments. The next round selectively
 retransmits only missing fragments. If every fragment is already acknowledged
 but COMPLETE was lost, the final fragment is sent as a bounded completion
-probe. A transfer uses at most eight rounds.
+probe. A transfer uses the selected six-, eight-, or ten-round ceiling.
 
 COMPLETE is distinct from a full bitmap. The receiver sends COMPLETE only
 after all fragments are present, their combined length fits the BitChat packet
@@ -199,8 +250,10 @@ both a progress deadline,
 refreshed only by a new fragment, and an absolute lifetime that cannot be
 extended. Feedback wait, progress timeout, absolute lifetime, and completed
 retention are derived from the active SF, bandwidth, coding rate, preamble,
-maximum frame airtime, fragment count, eight-round budget, and bounded
-contention allowance. No supported SF relies on a fixed ten-second timeout.
+maximum frame airtime, fragment count, selected round budget, and bounded
+contention allowance. Receiver retention uses the conservative ten-round
+ceiling because the sender policy is intentionally not encoded on air. No
+supported SF relies on a fixed ten-second timeout.
 Temporary channel occupancy does not discard an addressed transfer after a
 fixed number of CAD results: the sender returns to RX during randomized
 backoff and retries until COMPLETE, ABORT, or its absolute deadline.

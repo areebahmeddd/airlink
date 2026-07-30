@@ -25,7 +25,12 @@ SMOKE_RE = re.compile(
 FORWARD_SMOKE_RE = re.compile(
     r"diagnostic forwarding smoke enqueue len=(\d+) expected_frags=(\d+)"
 )
-PROFILE_RE = re.compile(r"trunk up: region=(\w+).* SF(\d+).*preamble=(\d+)")
+PROFILE_RE = re.compile(
+    r"trunk up: board=(\S+) region=(\w+) ([0-9.]+) MHz "
+    r"SF(\d+) BW(\d+) "
+    r"CR4/(\d+) preamble=(\d+) sync=0x([0-9a-fA-F]+).*"
+    r"phy_verified=(\d+)"
+)
 DIAG_RE = re.compile(
     r"tmo=(\d+).*radio_err=(\d+).*busy_tmo=(\d+).*"
     r"recover=(\d+)/(\d+).*tx_watchdog=(\d+)"
@@ -67,6 +72,17 @@ FORWARD_TX_RE = re.compile(
 FORWARD_RX_RE = re.compile(
     r"trunk v\d+ RX packet .*hops=(\d+)/(\d+)"
 )
+ADAPTIVE_TX_RE = re.compile(
+    r"trunk accepted .*link=(\d+) chunk=(\d+) rounds=(\d+)"
+)
+LINK_METRICS_RE = re.compile(
+    r"link metrics profile=(\d+) rssi_x10=(-?\d+) snr_x10=(-?\d+) "
+    r"data=(\d+) ack=(\d+) retries_x100=(\d+) latency_ms=(\d+) "
+    r"samples=(\d+)/(\d+)/(\d+)"
+)
+AUTHENTICATED_NEIGHBOR_RE = re.compile(
+    r"\bauthenticated neighbor result=\d+"
+)
 
 
 def reader(
@@ -76,7 +92,7 @@ def reader(
     stop: threading.Event,
     reset: bool,
 ):
-    with serial.Serial(port, 115200, timeout=0.2) as stream:
+    with serial.Serial(port, 115200, timeout=0) as stream:
         if reset:
             # Assert EN while keeping GPIO0 deasserted, then release EN.
             stream.dtr = False
@@ -84,10 +100,21 @@ def reader(
             time.sleep(0.1)
             stream.rts = False
             time.sleep(0.1)
+        pending = bytearray()
         while not stop.is_set():
-            line = stream.readline().decode("utf-8", errors="replace").rstrip()
-            if line:
-                output.put((label, line))
+            available = stream.in_waiting
+            if available == 0:
+                stop.wait(0.02)
+                continue
+            pending.extend(stream.read(available))
+            while b"\n" in pending:
+                raw_line, _, remainder = pending.partition(b"\n")
+                pending = bytearray(remainder)
+                line = raw_line.decode(
+                    "utf-8", errors="replace"
+                ).rstrip("\r")
+                if line:
+                    output.put((label, line))
 
 
 def main() -> int:
@@ -95,7 +122,7 @@ def main() -> int:
     parser.add_argument(
         "ports", nargs="+", help="serial ports for two or more nodes"
     )
-    parser.add_argument("--seconds", type=int, default=75)
+    parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--json-out")
     parser.add_argument(
         "--reset", action="store_true",
@@ -112,6 +139,7 @@ def main() -> int:
         threading.Thread(
             target=reader,
             args=(f"node-{index + 1}", port, messages, stop, args.reset),
+            daemon=True,
         )
         for index, port in enumerate(args.ports)
     ]
@@ -125,6 +153,7 @@ def main() -> int:
             "raw": [],
             "events": Counter(),
             "diagnostics": [],
+            "link_metrics": [],
             "profile": None,
         }
         for index in range(len(args.ports))
@@ -157,9 +186,15 @@ def main() -> int:
                 )
             if match := PROFILE_RE.search(line):
                 summary[label]["profile"] = {
-                    "region": match.group(1),
-                    "spreading_factor": int(match.group(2)),
-                    "preamble_symbols": int(match.group(3)),
+                    "board": match.group(1),
+                    "region": match.group(2),
+                    "frequency_mhz": float(match.group(3)),
+                    "spreading_factor": int(match.group(4)),
+                    "bandwidth_hz": int(match.group(5)),
+                    "coding_rate_denominator": int(match.group(6)),
+                    "preamble_symbols": int(match.group(7)),
+                    "sync_word": int(match.group(8), 16),
+                    "phy_verified": bool(int(match.group(9))),
                 }
             if match := DIAG_RE.search(line):
                 summary[label]["diagnostics"].append(
@@ -255,7 +290,7 @@ def main() -> int:
                     summary[label]["diagnostics"].append(
                         forward_diag
                     )
-            if "authenticated neighbor" in line:
+            if AUTHENTICATED_NEIGHBOR_RE.search(line):
                 summary[label]["events"]["authenticated_neighbor"] += 1
             if match := CONTROL_RE.search(line):
                 direction = match.group(1).lower()
@@ -288,6 +323,31 @@ def main() -> int:
                 summary[label]["events"][
                     f"rx_hops_{match.group(1)}_of_{match.group(2)}"
                 ] += 1
+            if match := ADAPTIVE_TX_RE.search(line):
+                summary[label]["events"][
+                    f"adaptive_profile_{match.group(1)}"
+                ] += 1
+                summary[label]["events"][
+                    f"adaptive_chunk_{match.group(2)}"
+                ] += 1
+                summary[label]["events"][
+                    f"adaptive_rounds_{match.group(3)}"
+                ] += 1
+            if match := LINK_METRICS_RE.search(line):
+                summary[label]["link_metrics"].append(
+                    {
+                        "profile": int(match.group(1)),
+                        "rssi_x10": int(match.group(2)),
+                        "snr_x10": int(match.group(3)),
+                        "data_success_pct": int(match.group(4)),
+                        "ack_success_pct": int(match.group(5)),
+                        "retries_x100": int(match.group(6)),
+                        "latency_ms": int(match.group(7)),
+                        "signal_samples": int(match.group(8)),
+                        "data_samples": int(match.group(9)),
+                        "ack_samples": int(match.group(10)),
+                    }
+                )
             if "duplicate network packet" in line:
                 summary[label]["events"][
                     "network_duplicate_suppressed"
@@ -303,7 +363,7 @@ def main() -> int:
     finally:
         stop.set()
         for thread in threads:
-            thread.join()
+            thread.join(timeout=1)
 
     serializable = {
         label: {
@@ -312,6 +372,7 @@ def main() -> int:
             "raw": values["raw"],
             "events": dict(values["events"]),
             "diagnostics": values["diagnostics"],
+            "link_metrics": values["link_metrics"],
             "profile": values["profile"],
         }
         for label, values in summary.items()

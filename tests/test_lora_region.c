@@ -30,5 +30,32 @@ int main(void)
     assert(inferred == LORA_REGION_US915);
     assert(lora_region_infer(870000000, &inferred));
     assert(inferred == LORA_REGION_EU868);
+
+    lora_phy_profile_t base = {
+        .region = LORA_REGION_US915,
+        .frequency_hz = 911500000,
+        .spreading_factor = 10,
+        .bandwidth_hz = 125000,
+        .coding_rate = 5,
+        .preamble_symbols = 16,
+        .sync_word = LORA_PRIVATE_SYNC_WORD,
+        .tx_dbm = 22,
+    };
+    assert(lora_phy_profile_valid(&base));
+    lora_phy_profile_t peer = base;
+    peer.tx_dbm = 14;
+    assert(lora_phy_profiles_compatible(&base, &peer));
+    peer.coding_rate = 6;
+    assert(lora_phy_profile_valid(&peer));
+    assert(!lora_phy_profiles_compatible(&base, &peer));
+    peer = base;
+    peer.frequency_hz = 869525000;
+    assert(!lora_phy_profile_valid(&peer));
+    peer = base;
+    peer.sync_word = 0x2444;
+    assert(!lora_phy_profile_valid(&peer));
+    peer = base;
+    peer.preamble_symbols = 65;
+    assert(!lora_phy_profile_valid(&peer));
     return 0;
 }
