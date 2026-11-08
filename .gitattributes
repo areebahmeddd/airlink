@@ -1,0 +1,2 @@
+# LF everywhere, as ESP-IDF's style requires.
+* text=auto eol=lf

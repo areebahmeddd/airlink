@@ -1,46 +1,32 @@
-# ESP-IDF build output
+# Build output: idf.py (build/<board>-<profile>), the host tests and fuzzers
 build/
 build-*/
-cmake-build-*/
-CMakeFiles/
-CMakeCache.txt
-*.ninja
-.ninja_log
-.ninja_deps
-
-# ESP-IDF configuration artifacts
-sdkconfig
-sdkconfig.old
-sdkconfig.*.backup
-sdkconfig.*.old
-dependencies.lock
-
-# Flash images and intermediate binaries
-*.bin
-*.elf
-*.map
-flash_args
-partition_table/
-bootloader/
-
-# Python cache
+managed_components/
 __pycache__/
 *.pyc
 
-# IDE/editor metadata
+# Generated configuration: a build's sdkconfig is never committed; the
+# dependencies.lock.<target> files are
+sdkconfig
+sdkconfig.old
+
+# Images and signing outputs are release artifacts, never sources, and so is
+# what the Publish Web Flasher workflow adds to the flasher
+*.bin
+*.elf
+*.map
+*.ahot
+SHA256SUMS
+flasher/firmware/
+flasher/manifests/
+flasher/esp-web-tools/
+
+# Keys live offline, never here (docs/RELEASE.md)
+*owner_key*.pem
+*secure_boot_signing_key*.pem
+
+# Editors and logs
 .vscode/
 .idea/
 .DS_Store
-
-# Logs and scratch
 *.log
-
-# Display simulator outputs
-tools/screen_sim
-tools/frame_*.png
-tools/font.png
-
-# OTA: signed manifests are release artifacts; the owner private key must
-# never be committed (it lives outside the repo).
-*.bota
-*bitle_owner_key*
