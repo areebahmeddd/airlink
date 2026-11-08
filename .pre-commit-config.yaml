@@ -1,0 +1,34 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^components/[^/]+/third_party/
+      - id: end-of-file-fixer
+        exclude: ^components/[^/]+/third_party/
+      - id: mixed-line-ending
+        args: [--fix=lf]
+        exclude: ^components/[^/]+/third_party/
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-merge-conflict
+      - id: detect-private-key
+  - repo: local
+    hooks:
+      - id: astyle_py
+        name: astyle (ESP-IDF rules)
+        entry: astyle_py --astyle-version=3.4.7 --rules=.astyle-rules.yml
+        language: system
+        types_or: [c, c++]
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check --fix
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format
+        language: system
+        types: [python]

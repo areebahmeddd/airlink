@@ -1,0 +1,15 @@
+# What the checks and the on-device tests need beyond ESP-IDF's own Python
+# environment, installed in a venv of its own. ESP-IDF's environment, pinned by
+# the image digest, already runs the tools' scripts and provides esptool,
+# cryptography and esp-idf-sbom. Compile with:
+#   uv pip compile --generate-hashes --python-version 3.12 --python-platform linux \
+#       -o requirements-dev.txt requirements-dev.in
+
+# Formatting and lint
+pre-commit==4.7.0
+ruff==0.17.4
+astyle_py==1.1.0
+
+# On-device tests
+pytest-embedded-idf==2.9.3
+pytest-embedded-serial-esp==2.9.3

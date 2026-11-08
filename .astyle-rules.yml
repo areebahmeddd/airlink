@@ -1,0 +1,9 @@
+# ESP-IDF's own rules, from its tools/ci/astyle-rules.yml.
+DEFAULT:
+  options: "--style=otbs --attach-namespaces --attach-classes --indent=spaces=4 --convert-tabs --align-reference=name --keep-one-line-statements --pad-header --pad-oper --unpad-paren --max-continuation-indent=120"
+
+vendored:
+  check: false
+  include:
+    - "/components/ah_proto/third_party/"
+    - "/components/ah_crypto/third_party/"
