@@ -1,0 +1,82 @@
+name: Publish Web Flasher
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag, such as v1.0.0
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  pages:
+    name: Publish Flasher
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tag itself: a branch of the same name must never stand in for it.
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      # The signed, merged images the maintainer attached to the published
+      # release (tools/release_sign.sh), each checked against the unsigned
+      # build CI attested for the tag: all but the signature blocks, the
+      # manifest and erased flash must be CI's own output (tools/check_merged.py).
+      - name: Fetch and check the signed images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          unsigned="$RUNNER_TEMP/unsigned"
+          mkdir -p "$unsigned"
+          for board in $(python3 tools/boards.py); do
+            gh release download "$TAG" --pattern "airlink-$board-merged.bin" --dir "flasher/firmware/$board"
+            gh release download "$TAG" --pattern "airlink-$TAG-$board-unsigned.tar.gz" --dir "$unsigned"
+            tar -xzf "$unsigned/airlink-$TAG-$board-unsigned.tar.gz" -C "$unsigned"
+            while IFS= read -r image; do
+              gh attestation verify "$image" --repo "$GITHUB_REPOSITORY" --source-ref "refs/tags/$TAG" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" >/dev/null
+            done < <(find "$unsigned/$board" -name '*.bin')
+            python3 tools/check_merged.py "flasher/firmware/$board/airlink-$board-merged.bin" "$unsigned/$board"
+          done
+          python3 tools/flasher_manifests.py flasher "$TAG"
+
+      # ESP Web Tools served from the site itself, unpacked from npm's tarball
+      # of the pinned version and checked against the integrity npm publishes
+      # for it. Every module the page loads is then the pinned one; a CDN link
+      # with subresource integrity would cover only the first file, not the
+      # chunks it imports.
+      - name: Vendor ESP Web Tools
+        env:
+          VERSION: 10.4.0
+          INTEGRITY: sha512-3pwkeFFm5Fj7UQo8SJNYK5RXrtNCpq6X9QoI6bMT4GBZWgrJqjn0YvM9ihG74BtMoSFYXfmDtkehuxe50PTMPQ==
+        run: |
+          tarball="$RUNNER_TEMP/esp-web-tools.tgz"
+          curl -fsSL -o "$tarball" "https://registry.npmjs.org/esp-web-tools/-/esp-web-tools-$VERSION.tgz"
+          test "sha512-$(openssl dgst -sha512 -binary "$tarball" | base64 -w0)" = "$INTEGRITY"
+          mkdir -p flasher/esp-web-tools
+          tar -xzf "$tarball" -C flasher/esp-web-tools --strip-components=3 package/dist/web
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: flasher
+
+      - name: Deploy site
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
