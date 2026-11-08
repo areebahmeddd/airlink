@@ -1,0 +1,30 @@
+{
+  "heltec_v4": {
+    "image_bytes": 762529,
+    "static_ram_bytes": 117803
+  },
+  "heltec_v4_r8": {
+    "image_bytes": 763265,
+    "static_ram_bytes": 119035
+  },
+  "heltec_v3": {
+    "image_bytes": 770625,
+    "static_ram_bytes": 112627
+  },
+  "tbeam_supreme": {
+    "image_bytes": 762185,
+    "static_ram_bytes": 117803
+  },
+  "xiao_s3_wio": {
+    "image_bytes": 762289,
+    "static_ram_bytes": 119035
+  },
+  "c6_devkit": {
+    "image_bytes": 958323,
+    "static_ram_bytes": 122595
+  },
+  "xiao_c6": {
+    "image_bytes": 938597,
+    "static_ram_bytes": 122267
+  }
+}

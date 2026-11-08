@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Airlink web flasher</title>
+  <meta name="description"
+    content="Install Airlink, a relay node for airhop, bitchat-ios and bitchat-android, on an ESP32 board from the browser.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <script type="module" src="esp-web-tools/install-button.js"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, sans-serif;
+      line-height: 1.6;
+    }
+
+    body {
+      max-width: 42rem;
+      margin: 0 auto;
+      padding: 2rem 1rem;
+    }
+
+    h1 {
+      margin: 0 0 0.75rem;
+    }
+
+    h2 {
+      font-size: 1.25rem;
+      margin: 2rem 0 0.75rem;
+    }
+
+    p,
+    ol {
+      margin: 0.75rem 0;
+    }
+
+    li+li {
+      margin-top: 0.6rem;
+    }
+
+    a {
+      text-underline-offset: 0.15em;
+    }
+
+    code,
+    pre {
+      font-size: 0.95em;
+    }
+
+    :focus-visible {
+      outline: 2px solid currentColor;
+      outline-offset: 2px;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    select,
+    button {
+      font: inherit;
+      min-height: 2.75rem;
+      padding: 0.4rem 0.6rem;
+    }
+
+    .install {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .notice {
+      border-inline-start: 3px solid currentColor;
+      padding-inline-start: 1rem;
+    }
+
+    footer {
+      margin-top: 2rem;
+      font-size: 0.95rem;
+    }
+
+    pre {
+      margin: 0.5rem 0 0;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <h1>Airlink</h1>
+    <p>A relay node for <a href="https://github.com/areebahmeddd/airhop">Airhop</a>,
+      <a href="https://github.com/permissionlesstech/bitchat">bitchat-ios</a> and
+      <a href="https://github.com/permissionlesstech/bitchat-android">bitchat-android</a>, installed from your browser.
+      You need Chrome or Edge on a desktop and a USB data cable.
+    </p>
+
+    <h2>Before installing</h2>
+    <div class="notice">
+      <p><strong>This installs a release image, and its first boot is permanent.</strong> It turns on Secure Boot and
+        flash encryption for good: the board then runs only images signed by this project, updates only over the air
+        from another Airlink node of the same board in Bluetooth range.</p>
+      <p>Keep it powered through that boot, which can take a minute. To keep a board you can reflash over USB, build
+        the development image from <a href="https://github.com/areebahmeddd/airlink#building-and-testing">the
+          source</a> instead.</p>
+    </div>
+
+    <h2>Install</h2>
+    <p>Plug the board in, pick it below, and select Connect.</p>
+    <div class="install">
+      <label for="board">Board</label>
+      <select id="board" autocomplete="off">
+        <option value="" disabled selected hidden>Choose your board</option>
+      </select>
+      <esp-web-install-button id="install" hidden></esp-web-install-button>
+    </div>
+
+    <h2>After installing</h2>
+    <p>Open a serial console at 115200 baud, then:</p>
+    <ol>
+      <li>On a LoRa board, set the region before it transmits: <code>region us</code>, <code>eu</code>,
+        <code>in</code>, <code>anz</code> or <code>sea</code>.
+      </li>
+      <li>To take Airlink's own updates from other nodes, give it the project's update key:
+        <pre tabindex="0"
+          aria-label="Update key command"><code>owner a6123922152c32f3e072a72ab9403d8a5810fa3eb05a9a29069fe3421d6945b4 e930e9606543e7b8</code></pre>
+      </li>
+      <li><code>reboot</code> applies the settings, and <code>status</code> shows them and what the node is doing.</li>
+      <li>Before the node leaves your hands, <code>lock yes</code> closes provisioning for good, once the update key is
+        set. Until then anyone with a USB cable can set their own key and lock the node to it.</li>
+    </ol>
+  </main>
+
+  <footer>
+    <p>Testing a node? Share how it went in the
+      <a href="https://github.com/areebahmeddd/airlink/issues/1">call for testers</a>.
+      Source and documentation are on <a href="https://github.com/areebahmeddd/airlink">GitHub</a>.
+    </p>
+  </footer>
+
+  <script type="module">
+    const select = document.getElementById("board");
+    const button = document.getElementById("install");
+    const pick = () => {
+      button.setAttribute("manifest", `manifests/${select.value}.json`);
+      button.hidden = false;
+    };
+    for (const { id, title } of await(await fetch("manifests/boards.json")).json()) {
+      select.add(new Option(title, id));
+    }
+    select.addEventListener("change", pick);
+  </script>
+</body>
+
+</html>

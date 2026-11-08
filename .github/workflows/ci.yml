@@ -1,30 +1,101 @@
-name: Firmware CI
+name: Code Quality and Testing
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "flasher/**"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "flasher/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # Both supported node targets: XIAO ESP32C3 (reference) and
-        # XIAO ESP32S3 (LoRa backhaul platform).
-        target: [esp32c3, esp32s3]
-    container:
-      # Pinned to the ESP-IDF version the firmware is developed and tested on.
-      # `latest` drifts ahead (v6.1+) and fails on stricter warnings-as-errors
-      # and mbedTLS API changes that v6.0 does not have.
-      image: espressif/idf:release-v6.0
+  host:
+    name: Host Checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Build ${{ matrix.target }} firmware
-        shell: bash
+      - name: Build tools image
+        run: docker build -t airlink-tools:dev docker
+
+      - name: Check formatting and lint
+        run: scripts/docker.sh 'git config --global --add safe.directory /work && pre-commit run --all-files --show-diff-on-failure'
+
+      - name: Check spec vectors reproduce
         run: |
-          . /opt/esp/idf/export.sh
-          idf.py set-target ${{ matrix.target }}
-          idf.py build
+          scripts/docker.sh 'python3 tools/vectors/gen_spec_vectors.py test/vectors/spec-vectors.json'
+          git diff --exit-code -- test/vectors
+
+      - name: Run static analysis
+        run: scripts/docker.sh scripts/static-analysis.sh
+
+      - name: Run host tests (ASan, UBSan)
+        run: scripts/docker.sh 'cmake -S test/host -B build-host -G Ninja && cmake --build build-host && ctest --test-dir build-host --output-on-failure'
+
+      - name: Measure coverage
+        run: scripts/docker.sh scripts/coverage.sh
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./build-coverage/lcov.info
+          fail_ci_if_error: true
+
+      - name: Run fuzz smoke
+        run: FUZZ_SECONDS=30 scripts/docker.sh scripts/fuzz-smoke.sh
+
+  firmware:
+    name: Build ${{ matrix.board }} (${{ matrix.profile }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: host
+    strategy:
+      fail-fast: false
+      matrix:
+        board:
+          - heltec_v4
+          - heltec_v4_r8
+          - heltec_v3
+          - tbeam_supreme
+          - xiao_s3_wio
+          - c6_devkit
+          - xiao_c6
+        profile: [dev, release]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build tools image
+        run: docker build -t airlink-tools:dev docker
+
+      - name: Build firmware
+        run: scripts/docker.sh 'scripts/build.sh ${{ matrix.board }} ${{ matrix.profile }}'
+
+      - name: Check component locks unchanged
+        run: git diff --exit-code -- 'dependencies.lock.*'
+
+      # The baseline is the dev build's; a release build only differs by its profile.
+      - name: Check size gate
+        if: matrix.profile == 'dev'
+        run: scripts/docker.sh 'scripts/size-gate.sh ${{ matrix.board }}'
