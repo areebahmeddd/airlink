@@ -1,22 +1,22 @@
-/* 5x7 uppercase bitmap font for the status display. Column-major: each
- * glyph is 5 bytes, bit0 = top pixel. Glyphs cover A-Z, 0-9 and a small
- * symbol set; anything unmapped renders as a filled box. Hand-drawn for
- * Bitle (public domain). */
+// SPDX-FileCopyrightText: 2026 Areeb Ahmed
+// SPDX-License-Identifier: MIT
 
-#ifndef BITLE_FONT_H_INCLUDED
-#define BITLE_FONT_H_INCLUDED
+// A 5 x 7 bitmap font: upper case, digits and a few symbols, from the classic
+// public-domain 5 x 7 set. Column-major: five bytes a glyph, bit 0 the top
+// pixel.
+#pragma once
 
 #include <stdint.h>
 
-#define BITLE_FONT_W 5
-#define BITLE_FONT_H 7
+#define AH_FONT_W 5
+#define AH_FONT_H 7
 
 typedef struct {
     char ch;
-    uint8_t col[BITLE_FONT_W];
-} bitle_font_glyph_t;
+    uint8_t col[AH_FONT_W];
+} ah_font_glyph_t;
 
-static const bitle_font_glyph_t BITLE_FONT[] = {
+static const ah_font_glyph_t s_font[] = {
     { ' ',  { 0x00, 0x00, 0x00, 0x00, 0x00 } },
     { '0',  { 0x3E, 0x51, 0x49, 0x45, 0x3E } },
     { '1',  { 0x00, 0x42, 0x7F, 0x40, 0x00 } },
@@ -69,21 +69,17 @@ static const bitle_font_glyph_t BITLE_FONT[] = {
     { '?',  { 0x02, 0x01, 0x51, 0x09, 0x06 } },
 };
 
-#define BITLE_FONT_GLYPH_COUNT (sizeof(BITLE_FONT) / sizeof(BITLE_FONT[0]))
-
-static inline const uint8_t *bitle_font_glyph(char ch)
+// Lower case folds to upper; anything else unmapped draws as a box.
+static inline const uint8_t *ah_font_glyph(char ch)
 {
-    /* Fold lowercase to uppercase: the display charset is mono-case. */
     if (ch >= 'a' && ch <= 'z') {
-        ch -= ('a' - 'A');
+        ch = (char)(ch - ('a' - 'A'));
     }
-    for (unsigned i = 0; i < BITLE_FONT_GLYPH_COUNT; ++i) {
-        if (BITLE_FONT[i].ch == ch) {
-            return BITLE_FONT[i].col;
+    for (unsigned i = 0; i < sizeof(s_font) / sizeof(s_font[0]); ++i) {
+        if (s_font[i].ch == ch) {
+            return s_font[i].col;
         }
     }
-    static const uint8_t unknown[BITLE_FONT_W] = { 0x7F, 0x41, 0x41, 0x41, 0x7F };
-    return unknown;
+    static const uint8_t box[AH_FONT_W] = {0x7F, 0x41, 0x41, 0x41, 0x7F};
+    return box;
 }
-
-#endif /* BITLE_FONT_H_INCLUDED */
