@@ -1,104 +1,91 @@
-# Bitle Over-the-Air Updates
+# Over-the-Air Updates
 
-Bitle nodes update their own firmware in the field and gossip new images
-to each other across the mesh, so a fleet on a trail can be updated without
-retrieving hardware. This document covers the trust model, the one-time
-setup, and how to cut and distribute a release.
+Airlink nodes (Airhop's relay firmware) update each other: a node running a newer image offers it to a neighbor node running an older one, and the neighbor pulls it over Bluetooth, checks it, and boots it on trial. One wired node updates a fleet. This page covers the trust model, the keys, the packets and how to cut an update.
 
-> **Deploy the OTA-capable image before sealing enclosures.** OTA cannot be
-> retrofitted remotely: a node flashed with a single-`factory` partition
-> layout has nowhere to stage an update. Flash the dual-slot image
-> (this firmware) by wire first; after that, everything is remote.
+## Trust Model
 
-## Trust model
+Two keys at two layers, kept apart and both offline ([RELEASE.md](RELEASE.md)):
 
-Every image is authenticated by an **Ed25519 owner key**. The private key
-lives offline on your machine and signs releases; only the 32-byte public
-key is compiled into the firmware (`main/ota_owner_pubkey.h`). A node:
+- **The Secure Boot key** (release builds): the chip's ROM checks the bootloader and the bootloader checks the app against it on every boot. It decides what the chip will run at all.
+- **The fleet's owner key** (Ed25519): a node checks an image's signed manifest against it before taking a single byte of the image. It decides which updates a fleet accepts from the mesh.
 
-- verifies the signed manifest before accepting a single byte of an image,
-- verifies the SHA-256 of the fully written image before switching to it,
-- refuses any version less than or equal to what it runs (no downgrades),
-- boots the new image on a **rollback trial**: if it does not prove itself
-  healthy (a peer connects and its announce verifies end to end), the
-  bootloader automatically reverts to the previous image on the next reset.
+The owner key is per fleet and provisioned per node (`owner <key> <fingerprint>` at the console, write-once), not compiled in. A node with no owner key neither serves nor accepts updates. Until a node is locked (`lock yes`), anyone at its console can set the key, so provisioning and locking it are part of deploying it.
 
-Losing the private key means you can never ship another update to deployed
-nodes — **back it up**. Compromise of the private key means an attacker can
-push firmware to your fleet — **keep it offline**.
+A node:
 
-## One-time setup
+- accepts a manifest only if the owner key signed it and it names this node's board;
+- checks at most one manifest per link every 10 s, since each costs a signature check before anything else about it is known;
+- takes only a strictly newer version: never a downgrade, never the same version again, and never a version at or below one it rolled back from, which it keeps in NVS, since the bootloader's own record of the rollback is erased when the next transfer starts;
+- writes the image as it arrives and checks its SHA-256 whole against the manifest before it can boot it; ESP-IDF then checks the image itself (and its Secure Boot signature on a release build);
+- boots the new image on a rollback trial. The trial ends once the image has run 15 minutes (`AH_OTA_TRIAL_MIN`, long enough to reach what an image fails at a few minutes in: the first clock save, mail write, beacon and sync rounds) and a neighbor's announce has verified over a live link, or after 30 minutes up without a crash (`AH_OTA_TRIAL_FALLBACK_MIN`), so a node alone at a site keeps the image through its next power cut. A crash before then boots the previous image, and an image on trial is never offered to other nodes, so one that fails rolls back before it spreads. A trial ended by a fault (a panic or a watchdog) refuses that version for good; one ended by a power cut, a brownout or a restart says nothing of the image, and the version is tried at most three times in all. An image fetched whole and then refused (its hash, or ESP-IDF's checks), or a transfer given up as too slow (a server that drops the link early included), is not fetched again from the node that served it for an hour; another node's copy is taken. The node remembers one such server at a time, so a hostile node that keeps minting identities can hold an update back a minute or so per identity, each costing it a fresh verified announce.
 
-```bash
-pip install cryptography
-python tools/gen_owner_key.py            # writes ~/bitle-keys/bitle_owner_key.hex
-                                         # and main/ota_owner_pubkey.h (commit this)
+With the trial and no offers while on it, each hop takes about 20 minutes (the trial, the next offer and a transfer of a few minutes), so an update crosses ten hops in three hours or more.
+
+Anti-rollback (release builds) adds a floor the bootloader enforces from eFuse; raising it is a deliberate release step.
+
+## Link-Local, Never Through Phones
+
+Phones relay packet types they do not know, so an OTA packet with any TTL to spare would flood through every phone in range. OTA packets therefore:
+
+- carry TTL 0 and are addressed to the one neighbor they are for;
+- go only on a Bluetooth link to a peer whose verified announce marks it a node (`0xB1` bit 0);
+- are taken only from such a link, from the peer bound to it, and never enter the mesh.
+
+They never cross the LoRa trunk: an image would take days of a region's duty budget. Airhop's PROTOCOLS section 3 reserves `0xA0` to `0xA3`, `0xB0` and `0xB1` for relay firmware so Airhop never allocates them.
+
+## Packets
+
+| Type   | Name     | From     | Payload                                                         |
+| ------ | -------- | -------- | --------------------------------------------------------------- |
+| `0xA0` | MANIFEST | server   | the 125-byte signed manifest                                    |
+| `0xA1` | REQUEST  | receiver | `version(4) offset(4) length(2)`                                |
+| `0xA2` | CHUNK    | server   | `version(4) offset(4) data`                                     |
+| `0xA3` | STATUS   | receiver | `code(1)`: `00` applied, `E1` hash mismatch, `E2` flash refused |
+
+Integers are big-endian. The receiver asks for each piece in turn, sized to fit its link (at most 472 bytes: what a 512-byte Bluetooth frame holds after the packet's header and both IDs and the piece's own 8 bytes), and asks again after 4 s without an answer; the transfer ends at the 41st unanswered request in a row, or once it has run a minute and moves slower than 512 bytes a second, and a piece of any size but the one asked for is ignored, so no server can trickle a transfer out for hours. So a server answers with exactly the size asked, never less, and every later version has to as well. An offer goes to a neighbor at most once a minute, when its announce (`0xB0`) shows an older version.
+
+Manifest (`components/ah_proto/src/ah_ota_manifest.c`):
+
+```text
+"AHOT" format(1)=1 version(4) size(4) sha256(32) board(16, NUL-padded) | signature(64)
 ```
 
-Back up `~/bitle-keys/bitle_owner_key.hex` somewhere safe and offline. Commit
-the regenerated `main/ota_owner_pubkey.h`. Do this once, before building the
-images you deploy.
+`version` is `major << 16 | minor << 8 | patch`, as the announce carries it. The Ed25519 signature covers `"airhop-fw-v1"` followed by every byte before it.
 
-## Cutting a release
-
-1. Bump `BITLE_FW_VERSION` in `main/bitle_ota.h` (strictly increasing).
-2. Build, then sign the image with the same version number:
-
-   ```bash
-   idf.py build
-   python tools/sign_fw.py build/bitle.bin --version <N>   # match BITLE_FW_VERSION
-   ```
-
-   This writes `build/bitle.bin.bota`, a 110-byte signed manifest that
-   travels ahead of the image.
-
-## Distributing a release
-
-**Seeding (getting v_N onto the first node):** push `bitle.bin.bota`
-followed by the image to any one node from a BLE-capable tool (a phone app
-or laptop script that speaks the four `0xA0`–`0xA3` OTA packet types). That
-node verifies, applies, reboots into the new image, and begins advertising
-the new version.
-
-**Propagation (the mesh does the rest):** Bitle nodes discover and connect
-to each other directly over BLE (they run as BLE central *and* peripheral,
-so a node keeps accepting phones while dialing peer nodes — two outbound
-peer links max, with slots always reserved for phones). Each node advertises
-its firmware version in a private announce TLV (`0xB0`). A node running a
-newer image that hears a stale neighbor offers its signed manifest; the
-stale node requests chunks and pulls the image node-to-node. A node that
-finishes updating stores the manifest and immediately becomes a server
-itself, so one seeded node epidemically updates every node it can reach —
-no phone required.
-
-> Phones do **not** carry OTA traffic: BitChat drops unknown packet types
-> rather than relaying them, so propagation rides Bitle's own node-to-node
-> links, not phone bridges.
-
-To let a **wire-flashed** node serve its own running image to peers, flash
-the matching manifest into its `fw_manifest` partition:
+## One-Time Setup
 
 ```bash
-python tools/seed_manifest.py <port> build/bitle.bin.bota   # then reset
+python3 tools/ota_manifest.py keygen ~/airlink-keys      # owner_key.pem, and the line that provisions a node
+python3 tools/ota_manifest.py provision --key ~/airlink-keys/owner_key.pem   # that line again, later
 ```
 
-On boot the node verifies the manifest against its own flash and starts
-serving. A node that received its image over the air already has the
-manifest and serves with no extra step.
+Keep `owner_key.pem` offline and backed up: losing it ends updates for the fleet, and leaking it lets anyone push images to it. On each node, at its serial console, before it is deployed:
 
-## Wire protocol (packet types)
+```text
+owner <the 64-digit public key> <its 16-digit fingerprint>
+status
+lock yes
+reboot
+```
 
-| Type | Name         | Direction        | Payload                                   |
-|------|--------------|------------------|-------------------------------------------|
-| 0xA0 | OTA_MANIFEST | server → client  | 110-byte signed manifest                  |
-| 0xA1 | OTA_REQ      | client → server  | `version(4) chunk_index(4)`               |
-| 0xA2 | OTA_CHUNK    | server → client  | `version(4) chunk_index(4) data(≤chunk)`  |
-| 0xA3 | OTA_STATUS   | client → server  | `code(1)` (0x00 ok, 0xEx error)           |
+The key is written once, so the node takes it only with the fingerprint the tool printed: a mistyped key has another fingerprint and is refused. `status` shows the fingerprint set; `lock yes` then closes provisioning for good, and `reboot` applies both.
 
-Manifest layout: `"BOTA" version(4) size(4) sha256(32) chunk(2) sig(64)`,
-all integers big-endian; the signature covers
-`"bitle-fw-v1" || version || size || sha256 || chunk`.
+## Cutting an Update
 
-Transfers are stop-and-wait with receiver-driven requests and a
-resume-on-timeout retry, so a dropped BLE link resumes rather than
-restarting.
+1. Raise `PROJECT_VER` in `CMakeLists.txt` and move the changelog's Unreleased section under the new version ([RELEASE.md](RELEASE.md) cuts a project release end to end).
+2. Build the board's image (`scripts/build.sh <board> release`, or `dev` for a development fleet).
+3. Sign its manifest: `python3 tools/ota_manifest.py sign --key owner_key.pem --board <board> airlink.bin` (`tools/release_sign.sh` does this, and the Secure Boot signing, for a release).
+
+## Seeding the First Node
+
+Flash the image by wire (`scripts/build.sh <board> <profile> flash`, or the web flasher, whose release images carry their manifest already), then write its manifest beside it, in the `manifest` partition:
+
+```bash
+esptool write-flash 0x1a000 airlink.bin.ahot
+```
+
+The node checks the manifest against its own running image at boot and serves it from then on. A node that received its image over the air keeps the manifest it came with and serves it too, so the update spreads node to node. Each app slot's manifest is kept apart, so a node that rolls back still serves the image it returned to.
+
+Updates travel only over Bluetooth, between nodes of the same board: a node with no newer node of its board in Bluetooth reach (alone at its site, or a LoRa repeater kilometers from the next) never updates, and a release board takes no wired image either. Plan a fleet with that in mind: seed each site, and keep a fresh, never-booted board of each model to seed each release, since a release board once booted cannot be flashed by wire.
+
+Sign development and release images with different owner keys. A manifest names its board and version but not its profile, so under one key a release node would fetch a development image only to have Secure Boot refuse it, and a development node would take a release image whose app refuses to run without flash encryption, roll back on a fault, and then refuse that version and every one below it.

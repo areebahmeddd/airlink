@@ -1,159 +1,91 @@
-# Bitle
+# Airlink
 
-Bitle is an autonomous mesh network for BitChat, built from small solar-powered ESP32 nodes. Once flashed, a node needs no phone and no user interaction: it advertises over BLE, completes Noise XX handshakes, validates and re-broadcasts BitChat packets, carries store-and-forward courier mail for offline recipients, gossip-syncs recent public traffic with peers, and self-propagates signed firmware updates node-to-node. Two node types work together: ESP32-C3 nodes form the local Bluetooth mesh that phones connect to, and ESP32-S3 nodes add an SX1262 LoRa radio that carries a **long-range node-to-node trunk** — kilometer-scale hops that bridge BLE gaps with no phone in the path. Bitle is well suited to extending a BitChat mesh in places like remote trails, campsites, or any offline comms grid, and is designed for solar/battery deployments where the enclosure is sealed and never touched again.
+<p>
+  <a href="https://github.com/areebahmeddd/airlink/releases"><img src="https://img.shields.io/github/v/release/areebahmeddd/airlink?style=flat-square" alt="release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="license" /></a>
+  <a href="https://github.com/espressif/esp-idf/releases/tag/v6.1"><img src="https://img.shields.io/badge/ESP--IDF-v6.1-red?style=flat-square" alt="ESP-IDF" /></a>
+  <a href="https://github.com/areebahmeddd/airlink/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/areebahmeddd/airlink/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
+  <a href="https://codecov.io/gh/areebahmeddd/airlink"><img src="https://img.shields.io/codecov/c/github/areebahmeddd/airlink?style=flat-square" alt="coverage" /></a>
+  <a href="https://securityscorecards.dev/viewer/?uri=github.com/areebahmeddd/airlink"><img src="https://api.securityscorecards.dev/projects/github.com/areebahmeddd/airlink/badge?style=flat-square" alt="OpenSSF Scorecard" /></a>
+</p>
 
-The reference hardware pairs an ESP32-C3 with a flexible 2.4 GHz antenna, a weatherproof enclosure, solar input, and a battery pack. The firmware is developed and tested on ESP-IDF v6.0 and runs unmodified on both the `esp32c3` and `esp32s3` targets — the same source powers XIAO ESP32C3 nodes and the XIAO ESP32S3, which adds the LoRa backhaul (the LoRa radio is auto-detected at boot, so a node with no SX1262 simply runs BLE-only).
+Relay node firmware for [Airhop](https://github.com/areebahmeddd/airhop), [bitchat-ios](https://github.com/permissionlesstech/bitchat) and [bitchat-android](https://github.com/permissionlesstech/bitchat-android). It turns an ESP32 board into a fixed node in a Bluetooth mesh of phones and forwards their packets unchanged and unread, so two phones out of each other's range still reach each other. A board with an SX1262 LoRa radio also links to another node kilometers away, with no phone in between.
 
-## What it does
+It implements the bitchat protocol as Airhop's specification defines it ([docs/PROTOCOL.md](docs/PROTOCOL.md)). It cannot read the messages it carries, holds no key but its own, and does not advertise which phones are near it.
 
-A single node runs a genuinely simultaneous **dual-role BLE stack** on NimBLE. It advertises a connectable BitChat GATT peripheral so phones can subscribe, while a periodic central scanner discovers and dials *other Bitle nodes* — so one node holds links to phones **and** other Bitles at the same time. Out of a 6-connection budget it dials at most 2 outbound node-to-node links and keeps at least 2 slots reserved for inbound phones. This lets the mesh propagate across gaps with no phone in the path.
+Read the [Airlink whitepaper](https://github.com/areebahmeddd/airhop/blob/main/docs/paper/airlink/airlink-whitepaper.pdf) for the full design.
 
-## Features
+## What It Does
 
-- **Full BitChat handshake.** Implements the Noise XX pattern (`Noise_XX_25519_ChaChaPoly_SHA256`) via the bundled `noise_ref` (Noise-C) reference library, with Ed25519 identity binding like the mobile apps. Each node persists a Curve25519 static keypair and an Ed25519 signing keypair in NVS; its 8-byte peer ID is the first 8 bytes of SHA-256 over its Noise static public key.
+| Feature    | Description                                                                                                                                                                                                                              |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Relay      | Forwards each packet once to every neighbor, with the same TTL and timing rules the phones use, and keeps live voice and video on time                                                                                                   |
+| LoRa link  | Carries text between nodes kilometers apart, authenticated between each pair of nodes, sent to all neighbors in one transmission, acknowledged and retried, within each region's power and airtime limits ([docs/LORA.md](docs/LORA.md)) |
+| Catch-up   | Keeps recent public, location channel, group and board messages, and sends a phone what it missed while away                                                                                                                             |
+| Mailbox    | Holds end-to-end encrypted mail for a phone that is away, across reboots, and hands it over once that phone proves who it is                                                                                                             |
+| Updates    | Takes a newer firmware image from a neighboring node, signed with the fleet's key, and keeps the old one until the new one runs ([docs/OTA.md](docs/OTA.md))                                                                             |
+| In the app | Airhop lists the node as equipment, with a radio tower icon and no Message or Send ecash action; a bitchat user who messages it gets a reply saying it is a relay                                                                        |
 
-- **Signed identity announces with neighbor gossip.** Identity rides in a signed `ANNOUNCE` (type `0x01`) carrying TLVs for nickname, Noise static key, and Ed25519 signing key, the upstream `DIRECT_NEIGHBORS` gossip TLV (`0x04`, up to 10 verified direct peers, so phones can fold the node into their mesh graph and source-route through it), plus two Bitle-private TLVs: firmware version (`0xB0`) and role/authority flags (`0xB1`). A legacy `0x13` identity-announce is still emitted best-effort for older clients. Inbound announces are hard-rejected unless the sender ID equals SHA-256(announced Noise key)[0:8].
+## Boards
 
-- **Dual-role BLE mesh relay with source routing.** Packets are encoded/decoded with the BitChat binary format (v1 and v2) and forwarded like the upstream relay: TTL 0 stops forwarding, otherwise the TTL byte is decremented first. A v2 packet carrying a source route (flag `0x08`) is unicast toward the next hop when this node is listed in the route — peer IDs resolve to links through a direct-peer table — with duplicate-hop loop rejection, the signed route left byte-intact, and flood fallback when the next hop is not directly connected. Unrouted packets flood to every link except the ingress link and the original sender's own link. Flooding is de-duplicated with an FNV-1a fingerprint over the packet bytes (skipping the TTL byte) kept in a 64-entry ring. Own echoes, `REQUEST_SYNC`, packets addressed to this node, and undirected Noise handshakes are never relayed. A peer counts as **directly connected** exactly as upstream: a signature-verified announce from it arrived still at its origin TTL (7) on a live link. The node also learns the mesh graph from gossip TLVs and attaches source routes (version 2) to its own directed packets whose recipient is only reachable through the mesh, computed as the shortest path over mutually-confirmed edges. Phone-fragmented packets are reassembled in a small bounded pool (2 slots, up to 4 parts × 501 bytes, 15 s timeout); anything larger is forwarded relay-only. Max handled BLE packet size is 520 bytes (587 for routed v2). A 30 s subscribe watchdog drops links that connect but never enable notifications, and a short deny/cool-down list prevents immediately re-dialing a just-dropped peer.
+| Board                               | Chip     | LoRa   | Display | PSRAM |
+| ----------------------------------- | -------- | ------ | ------- | ----- |
+| Heltec WiFi LoRa 32 V4              | ESP32-S3 | SX1262 | OLED    | 2 MiB |
+| Heltec WiFi LoRa 32 V4-R8           | ESP32-S3 | SX1262 | OLED    | 8 MiB |
+| Heltec WiFi LoRa 32 V3              | ESP32-S3 | SX1262 | OLED    | None  |
+| LilyGO T-Beam Supreme               | ESP32-S3 | SX1262 | OLED    | 8 MiB |
+| Seeed XIAO ESP32-S3 with Wio-SX1262 | ESP32-S3 | SX1262 | None    | 8 MiB |
+| ESP32-C6-DevKitC-1                  | ESP32-C6 | None   | None    | None  |
+| Seeed XIAO ESP32-C6                 | ESP32-C6 | None   | None    | None  |
 
-- **LoRa long-range trunk (ESP32-S3 nodes).** When an SX1262 is detected at boot, the node brings up a 915 MHz LoRa backbone between nodes — a second radio the phones never touch. The trunk registers as one more link in the transport-agnostic link registry, so the mesh relays BLE↔LoRa with no special cases: a message crosses the trunk and comes back down to BLE at the far end. See the [LoRa backhaul](#lora-backhaul) section for the details (framing, ARQ, spreading factor, range).
+**Recommendation:** use the Heltec V4 for LoRa nodes, the V4 or the V4-R8 as its chip says (ESP32-S3R2 or ESP32-S3R8): each takes its own image. Its front end transmits up to 28 dBm where the region allows it, and its PSRAM holds the full tables; a board without PSRAM runs smaller ones and keeps less history and mail ([docs/MEMORY.md](docs/MEMORY.md)). Pin maps and per-board notes are in [docs/BOARDS.md](docs/BOARDS.md).
 
-- **Store-and-forward courier mailbox.** Accepts BitChat `CourierEnvelope` packets (type `0x04`) that phones deposit for offline recipients, stores them as opaque ciphertext keyed by SHA-256(ciphertext), and hands them over when the recipient — matched by a daily-rotating HMAC recipient tag — or another carrier later announces. The relay never learns envelope contents. Deposits are only accepted over a direct Noise link from a signature-verified, identity-verified sender. Budgets are enforced structurally: at most 128 envelopes, at most 8 per depositor, a 25 h lifetime cap, and a flash sector-ring that erases its oldest sector before it can overrun the partition.
+## Getting Started
 
-- **Gossip sync (dead-drop).** Keeps a small, RAM-bounded store (up to 80 recent *signed* public packets: announces, direct/group messages, prekey bundles) and reconciles it with peers using a Golomb-Rice/GCS set filter built to be bit-exact with upstream BitChat. When a phone subscribes, the node both answers the phone's `requestSync` (type `0x21`) by replaying packets it is missing (flagged RSR, TTL forced to 0) and pulls the phone's history by sending its own signed `requestSync`, at most once per peer per minute. Requests are gated (TTL 0, verified peer, rate-limited *before* signature verification), and eviction is expired-first then oldest-by-local-receive-order, so a flood of attacker-timestamped packets cannot evict legitimate data.
+1. **Flash** it from the [web flasher](https://areebahmeddd.github.io/airlink) in Chrome or Edge, or build it yourself (below). A board flashed from the web flasher then takes only signed updates, over the air ([docs/RELEASE.md](docs/RELEASE.md)).
+2. **Set the LoRa region** at the serial console (115200 baud). The node does not transmit on LoRa until a region is set, since no single setting is legal everywhere:
 
-- **Signed, mesh-propagating OTA with dual-slot rollback.** Deployed nodes update themselves and gossip new images node-to-node over BLE, no phone in the transfer path. Every image is authenticated by a single offline Ed25519 owner key before any byte is accepted, written to an ESP-IDF A/B slot, and re-verified by SHA-256 before the boot slot is switched. New images boot on a bootloader rollback trial that is only cancelled once the radio and crypto prove healthy (a peer's announce verifies end-to-end) or a 30-minute fallback elapses. See [docs/OTA.md](docs/OTA.md) and the [owner key](#firmware-updates--owner-key) section below.
+   ```text
+   region eu
+   reboot
+   status
+   ```
 
-- **BLE-derived clock with phone-authoritative time.** Bitle has no RTC. Wall-clock time is reconstructed as a persisted epoch base (seeded from the firmware build timestamp, never earlier) plus the ESP32 monotonic timer, then corrected from timestamps harvested *only* from directly-connected peers (relayed/replayed timestamps are ignored). A two-bit authority model (announce TLV `0xB1`) ranks sources: phones are the top authority and may correct even an already-synced clock, while relay nodes only carry real time forward once they themselves trace to a phone. An anti-poison anchor caps forward drift to real-time speed, a 30 s skew window keeps the clock well inside the ±120 s window iOS accepts, and the estimate is persisted to NVS so reboots resume from the last known time instead of rewinding by uptime.
+   The regions are `us`, `eu`, `in`, `anz` and `sea`; [docs/LORA.md](docs/LORA.md) gives the rule behind each.
 
-- **Deterministic `Bitle-####` nicknames.** On first boot a node derives a display nickname of the form `Bitle-####` (four decimal digits, mod 10000) from its own peer ID, and carries it in identity announces. A custom 1–31-char printable-ASCII name written to NVS is honored verbatim; a legacy `anon####` name is migrated to the branded form without touching the identity keypair. Note: the suffix is only four digits, so nicknames are not guaranteed unique across nodes. There is currently no wired-up runtime command to set or regenerate a nickname — custom names must be provisioned by writing the NVS `nickname` key directly.
+3. **Optionally** name it (`nickname relay-west`).
+4. **Provision and lock it before it leaves your hands.** Give it the fleet's update key with the fingerprint the key tool printed for it (`owner <key> <fingerprint>`, [docs/OTA.md](docs/OTA.md); the web flasher gives the project's own), check `status`, then `lock yes`, which cannot be undone, and `reboot`. Until it is locked, anyone with a USB cable can set their own update key and lock the node to it.
 
-- **Autonomous by design.** Once flashed the firmware advertises, accepts connections, relays, and keeps the mesh alive indefinitely with no supervision. Direct messages addressed to the node get a delivery ack and exactly one canned auto-reply per session (identifying Bitle as a relay and citing bitle.org); a chatty sender cannot cause ping-pong.
+## Building and Testing
 
-> **Note on the BLE advertised name.** The BLE device name is the fixed literal `Bitle Relay` (that exact string is how the central scanner recognizes other nodes). The `Bitle-####` value is an app-layer BitChat nickname, not the BLE advertising name.
-
-## LoRa backhaul
-
-On ESP32-S3 nodes with a Wio-SX1262 module, Bitle runs a second radio: a 915 MHz LoRa **trunk** that carries traffic between nodes over kilometer-scale hops. BLE stays the access layer phones connect to; LoRa is backhaul only — phones have no LoRa radio and never see it. A message travels `phone → BLE → node → LoRa → node → BLE → phone`, like a cell tower's short access hop plus a long backhaul.
-
-- **One firmware, radio auto-detected.** `bitle_lora_init()` probes for the SX1262 at boot (scratch-register check). Found → the trunk comes up; absent (every C3, a bare S3) → the node runs BLE-only. Board wiring (pin map, Vext power gate) is selected at build time via Kconfig: Seeed XIAO ESP32-S3 + Wio-SX1262 (default) and Heltec WiFi LoRa 32 V3 / Wireless Stick Lite V3 are supported — see [docs/LoRa-boards.md](docs/LoRa-boards.md).
-- **Trunk framing + reassembly.** Encoded BitChat packets are fragmented over ≤255-byte LoRa frames under a 16-byte trunk header (`0xB7 0x1E` magic, version, ftype, src/dst tag, seq, frag idx/total). Foreign LoRa traffic fails the magic check and is dropped. The receiver reassembles by `(src, seq)` and injects the packet into the same mesh core the BLE path uses.
-- **Per-frame ARQ.** Every non-announce frame is acknowledged and retransmitted up to three times; acks jump the queue and go out-of-band so a bidirectional exchange can't deadlock. Announces are ack-free periodic discovery beacons.
-- **Padding strip.** Phones pad handshakes/DMs to 256 bytes for BLE traffic-analysis resistance — pure airtime waste over the trunk. Because the BitChat packet is self-describing and padding trails the signature, the trunk trims to the true length before fragmenting (never touching signed/encrypted bytes). A 256-byte handshake message becomes one LoRa frame instead of three, which is what keeps a Noise first-contact handshake inside BitChat's timeout at high spreading factors.
-- **Admission + airtime governor.** The trunk carries relayed mesh traffic and the node's own discovery beacon; the node's own session-init and gossip `requestSync` are suppressed for broadcast links (a LoRa neighbor is a relay peer, not a chat/sync endpoint). Announces are throttled per origin (1 / 30 s) and pass a token-bucket airtime governor (default 25 % duty); message traffic is never throttled but still debits, so a busy DM session naturally quiets the beacons rather than the reverse. OTA image chunks stay off the trunk unless explicitly enabled (NVS `lora/ota_trunk`).
-- **Spreading factor and range.** Default **SF10 / BW125 / +22 dBm** — field-validated to complete an interactive DM (Noise handshake, auto-reply, receipts) through heavy non-line-of-sight (~700 ft / 30–40 walls). SF10 reaches ~2–3 km NLOS / ~8 km LOS; higher SF extends range at the cost of airtime (and handshake latency), lower SF is faster/shorter. Configurable via NVS `lora/sf`, `lora/freq`, `lora/duty_pct`, `lora/enabled`.
-
-Radio: **Semtech SX1262** (Seeed Wio-SX1262 + XIAO ESP32-S3, or Heltec V3 boards), +22 dBm, 902–928 MHz, 125 kHz bandwidth, 2 dBi SMA antenna.
-
-## Boot sequence
-
-`app_main()` runs a fixed init order: NVS → PSA crypto (with SHA-256/HMAC known-answer self-tests) → time → Noise → OTA → sync → courier → packet codec (with self-test) → link registry → mesh core → LoRa (radio-optional) → BLE init → BLE start, then spawns a single `bitle_main` FreeRTOS task that polls BLE, Noise, and the clock every 50 ms. Most init steps are fatal on failure (`ESP_ERROR_CHECK` / `abort`); the courier mailbox is the one optional subsystem — if it can't start, the node logs a warning and continues without store-and-forward. If NVS reports a layout/version change, the flash is erased and re-initialized rather than bricking boot.
-
-## Repository layout
-
-```
-├── CMakeLists.txt              # ESP-IDF project entry
-├── partitions.csv              # 4 MB OTA + msgstore layout
-├── sdkconfig.defaults          # configuration seed
-├── .github/workflows/ci.yml    # CI
-├── components/
-│   ├── bitchat_utils/          # bitchat_time: BLE-derived clock w/ authority tiers
-│   └── noise_ref/              # vendored Noise-C reference library (~97 files)
-├── docs/OTA.md                 # full OTA + node-to-node design
-├── tools/
-│   ├── gen_owner_key.py        # generate owner signing keypair + pubkey header
-│   ├── sign_fw.py              # sign a firmware image -> manifest
-│   ├── seed_manifest.py        # write manifest into fw_manifest partition
-│   └── courier_test.py         # BLE courier test harness (bleak + Ed25519)
-└── main/
-    ├── main.c
-    ├── bitchat_ble.{c,h}       # dual-role BLE transport (peripheral + central)
-    ├── bitle_link.{c,h}        # transport-agnostic link registry (BLE + LoRa)
-    ├── bitle_mesh.{c,h}        # transport-agnostic dispatch, dedup, fragments, relay
-    ├── bitle_route.{c,h}       # direct-peer table, neighbor graph, source-route BFS
-    ├── bitle_lora.{c,h}        # LoRa trunk: framing, ARQ, admission, padding strip
-    ├── sx1262.{c,h}            # SX1262 LoRa radio driver (ESP-IDF native)
-    ├── noise_handshake.{c,h}   # Noise XX, announce TLVs, message dispatch
-    ├── packet_codec.{c,h}      # BitChat binary packet encode/decode
-    ├── bitle_hash.{c,h}        # SHA-256/HMAC via PSA (mbedTLS 3.x & 4.x compatible)
-    ├── bitle_ota.{c,h}         # dual-slot OTA, signed manifests
-    ├── ota_owner_pubkey.h      # baked-in owner public key (generated)
-    ├── bitle_courier.{c,h}     # store-and-forward courier mailbox
-    ├── bitle_store.{c,h}       # flash sector-ring persistence (msgstore)
-    ├── bitle_sync.{c,h}        # gossip sync (GCS / requestSync)
-    └── nickname_manager.{c,h}  # deterministic Bitle-#### nicknames
-```
-
-`components/noise_ref` is a self-contained vendored third-party library, not Bitle-authored code.
-
-## Flash & partition layout
-
-The build seeds a **4 MB** flash with a custom partition table (`partitions.csv`), enables bootloader app rollback (trial boot with automatic revert), and uses NimBLE (Bluedroid disabled) in both central and peripheral roles. The layout is:
-
-| Partition | Purpose |
-| --- | --- |
-| `nvs` (24 K) | keys, nickname, persisted clock estimate |
-| `phy_init` (4 K) | RF calibration |
-| `otadata` (8 K) | A/B boot selection |
-| `fw_manifest` (4 K, subtype `0x40`) | 110-byte signed OTA manifest |
-| `ota_0` / `ota_1` (`0x1C0000` each) | dual-slot A/B application images |
-| `msgstore` (384 K, subtype `0x41`) | courier mailbox sector-ring |
-
-Because OTA relies on this dual-slot layout, **nodes must be wire-flashed with this partition table before their enclosures are sealed** — the A/B capability cannot be retrofitted remotely.
-
-## Hardware
-
-- **Bitle node (reference)** — Seeed Studio XIAO ESP32C3 with a 2.4 GHz antenna, solar charger, battery, and panel; the full parts list is at [bitle.org](https://bitle.org).
-- **Bitle-LR node (LoRa platform)** — the [Seeed Studio XIAO ESP32S3 & Wio-SX1262 kit](https://www.seeedstudio.com/Wio-SX1262-with-XIAO-ESP32S3-p-5982.html), also sold [with a 3D case, SMA antenna, and cable](https://www.seeedstudio.com/XIAO-ESP32S3-for-Meshtastic-LoRa-with-3D-Printed-Enclosure-p-6314.html). It ships pre-flashed with Meshtastic — run `idf.py erase-flash` before flashing Bitle. It runs the standard firmware as a full BLE relay node **and** brings up the SX1262 LoRa trunk between nodes (see [LoRa backhaul](#lora-backhaul)). Power parts (charger, battery, panel) are shared with the reference build.
-- **Bitle-LR node (Heltec V3)** — Heltec WiFi LoRa 32 V3 or Wireless Stick Lite V3 (ESP32-S3 + SX1262; both models share the same radio wiring). Select `CONFIG_BITLE_LORA_BOARD_HELTEC_V3=y` before building — the Vext peripheral rail is powered automatically; details in [docs/LoRa-boards.md](docs/LoRa-boards.md).
-
-## Building & flashing
-
-The firmware is developed and tested with **ESP-IDF v6.0** and supports the **`esp32c3`** and **`esp32s3`** targets — both validated on hardware (Seeed XIAO ESP32C3 and XIAO ESP32S3). All hashing goes through the PSA Crypto API, so it builds against both mbedTLS 3.x (v6.0 pre-release snapshots) and mbedTLS 4.x (v6.0 release line, which removed the legacy `mbedtls/sha256.h` API). The component manifest floors at IDF `>=5.0`, but v6.0 is what is actually built and tested.
-
-### Prerequisites
-
-- ESP-IDF installed (recommended: `~/esp-idf`)
-- Toolchain exported in the current shell before building:
+Everything builds in one pinned Docker image with ESP-IDF and the host tools, so a build comes out the same on every machine:
 
 ```bash
-source ~/esp-idf/export.sh
+scripts/docker.sh 'scripts/build.sh heltec_v4 dev'   # one board, in the dev or release profile
+scripts/check.sh                                     # the checks CI runs
 ```
 
-### Build
+With ESP-IDF v6.1 installed locally, `scripts/build.sh heltec_v4 dev flash monitor` builds, flashes and opens the console. The protocol core is plain C with no ESP-IDF dependency, so its tests, simulations and fuzzers run on the host under AddressSanitizer and UndefinedBehaviorSanitizer ([docs/TESTING.md](docs/TESTING.md)). Releases, signing and the one-time eFuse changes a release image makes are in [docs/RELEASE.md](docs/RELEASE.md). To contribute, start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
-```bash
-idf.py set-target esp32c3   # or esp32s3
-idf.py build
-idf.py -p /dev/cu.usbmodem101 flash monitor
-```
+## Documentation
 
-Adjust the serial port (`-p`) for your setup. `sdkconfig` is generated from `sdkconfig.defaults` on the first build; for `esp32s3`, `sdkconfig.defaults.esp32s3` layers on top (8 MB flash). On `esp32s3` the LoRa board wiring defaults to the Seeed XIAO + Wio-SX1262 — for Heltec V3 boards, select it via `idf.py menuconfig` → **Bitle hardware** → **SX1262 board wiring** before the first build (see [docs/LoRa-boards.md](docs/LoRa-boards.md)).
+| Document                                  | What it covers                                                               |
+| ----------------------------------------- | ---------------------------------------------------------------------------- |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md)   | The layers, the tasks, how a packet moves through the node and what persists |
+| [PROTOCOL.md](docs/PROTOCOL.md)           | Each protocol rule the node follows, where it is implemented and its test    |
+| [LORA.md](docs/LORA.md)                   | The LoRa link layer, airtime and the region profiles with their rules        |
+| [OTA.md](docs/OTA.md)                     | Node-to-node updates: the keys, the packets and publishing an update         |
+| [BOARDS.md](docs/BOARDS.md)               | Pin maps, RF paths, per-board notes and adding a board                       |
+| [MEMORY.md](docs/MEMORY.md)               | Flash layout, flash wear and the RAM tables per board                        |
+| [TESTING.md](docs/TESTING.md)             | The host checks, the on-device tests and the hardware test plan              |
+| [RELEASE.md](docs/RELEASE.md)             | Cutting a release, the two signing keys and what a release image burns in    |
+| [DESIGN-REVIEW.md](docs/DESIGN-REVIEW.md) | What review found, the decisions taken and the risks kept on purpose         |
+| [CONTRIBUTING.md](CONTRIBUTING.md)        | Setting up, testing, commits and pull requests                               |
+| [AGENTS.md](AGENTS.md)                    | The rules and conventions for changing the code                              |
 
-## Firmware updates & owner key
+## Acknowledgments
 
-Bitle supports signed, mesh-propagating over-the-air (OTA) updates, so nodes already deployed in the field can be upgraded without physical access. The full design — dual-slot A/B rollback, Ed25519-signed manifests, the health-signal rollback trial, and node-to-node propagation — is documented in [docs/OTA.md](docs/OTA.md).
-
-How propagation works, briefly: each node advertises an internal firmware version in announce TLV `0xB0`. This version is `BITLE_FW_VERSION` (defined in `main/bitle_ota.h`) — a monotonic OTA *update counter* used only for version comparison, **not** a product/marketing release number; nodes only accept strictly-higher versions and refuse downgrades. A node holding a signed manifest that matches its own running image offers it to any stale peer it sees (rate-limited to once per minute per link); the peer then pulls chunks as directed BitChat packets (types `0xA0`–`0xA3`), with authenticity guaranteed by the signed manifest and a full-image SHA-256 check rather than transport encryption, via a receiver-driven stop-and-wait protocol that resumes rather than restarts after a stall. Even a wire-flashed node can become a server by adopting a signed manifest from the `fw_manifest` partition (`tools/seed_manifest.py`).
-
-Trust is anchored by a single **owner key**. Each node ships trusting one Ed25519 public key, baked into `main/ota_owner_pubkey.h`; only the holder of the matching private key can sign an image the fleet will accept. The image is verified against that key before any byte is written, and the assembled image's SHA-256 is re-checked before the boot slot is switched. The private key lives outside the repo (by default `~/bitle-keys/bitle_owner_key.hex`) and is never committed.
-
-> **Running your own independent fleet?** The public key committed here belongs to the Bitle project, so nodes you flash from this repo unmodified will trust *official* Bitle firmware releases. If you are deploying a fleet you alone control, generate your own key pair first and rebuild:
->
-> ```bash
-> python tools/gen_owner_key.py   # writes ~/bitle-keys/bitle_owner_key.hex (private) and regenerates main/ota_owner_pubkey.h (public)
-> ```
->
-> Keep the private key offline and backed up: **losing it** means you can never OTA-update your deployed nodes again, and **leaking it** lets an attacker sign firmware for every node that trusts it.
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).  
-You are free to use, modify, and distribute this software, provided that attribution is given to the original author.
-
-- Firmware source: © 2025 Mark Soares, released under the MIT License.  
-- `components/noise_ref`: vendored Noise-C reference library. Licensing is per-file: MIT-style headers (Southern Storm Software) plus public-domain crypto primitives (donna, blake2). Review the per-file licenses before redistribution.
-
----
-
-For field deployment, drop the firmware onto an ESP32-C3 in your Bitle enclosure, connect power, and the node will immediately begin extending nearby BitChat meshes — relaying live traffic, carrying mail for offline peers, and keeping itself up to date on its own.
+- Forked from [Bitle](https://github.com/bitleproject/bitle) by Mark Soares, with the LoRa trunk frame, its reliability state machine and the Heltec V3 support by [callebtc](https://github.com/callebtc), and the optional LE Coded PHY link between nodes by [SHLOK333](https://github.com/SHLOK333), which this builds on.
+- [bitchat](https://github.com/permissionlesstech/bitchat), public domain: the protocol, and the vectors the codec is tested against.
+- [Monocypher](https://monocypher.org) and [miniz](https://github.com/richgel999/miniz), vendored with their licenses.
+- The [Meshtastic](https://meshtastic.org) board variants, for cross-checking pin maps and the Heltec V4 front end.
