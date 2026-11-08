@@ -1,6 +1,5 @@
-## IDF Component Manager Manifest File
+# Everything else is vendored under components/*/third_party with its license,
+# so the lock pins ESP-IDF alone.
 dependencies:
   idf:
-    version: ">=5.0"
-  bitchat_utils:
-    path: ../components/bitchat_utils
+    version: "==6.1.0"

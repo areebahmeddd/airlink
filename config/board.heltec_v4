@@ -1,0 +1,10 @@
+# Heltec WiFi LoRa 32 V4 (V4.2 and V4.3): ESP32-S3R2 (16 MiB flash, 2 MiB quad
+# PSRAM), native USB. The V4-R8, with the S3R8, is board.heltec_v4_r8.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_AH_BOARD_HELTEC_V4=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+# NimBLE takes its buffers from PSRAM, leaving internal RAM to the radios.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y

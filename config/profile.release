@@ -1,0 +1,36 @@
+# Release, as Espressif recommends for production (docs/RELEASE.md lists
+# every one-way eFuse step this takes on first boot). Binaries come out of
+# the build unsigned: the Secure Boot key stays offline, and
+# tools/release_sign.sh signs them.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+# A panic reboots without printing registers or stack to the console: the
+# core dump in flash keeps the evidence, and `crash` shows its summary.
+CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y
+
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=n
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y
+# Pinned on purpose, though each is ESP-IDF's default once the lines above are
+# set: a later default must not change them unseen. The offline signing key is
+# RSA-3072 (docs/RELEASE.md), so the scheme in particular has to stay put. It is
+# pinned through the app signing scheme choice: SECURE_BOOT_V2_RSA_ENABLED is
+# derived and has no prompt, so a line setting it would be ignored.
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_ENABLE_SECURE_ROM_DL_MODE=y
+
+# Settings and mailbox encrypted with keys generated on first boot into the
+# nvs_keys partition, which flash encryption covers. The HMAC scheme would need
+# its eFuse key burned before Secure Boot locks read protection, which a board
+# flashed from the browser never gets. NVS_ENCRYPTION is pinned as above.
+CONFIG_NVS_ENCRYPTION=y
+CONFIG_NVS_SEC_KEY_PROTECT_USING_FLASH_ENC=y
+
+# Anti-rollback: the bootloader refuses an image whose secure version is below
+# the eFuse's. Raise it on purpose, in its own release, when an old image
+# must never boot again.
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y
+CONFIG_BOOTLOADER_APP_SECURE_VERSION=1

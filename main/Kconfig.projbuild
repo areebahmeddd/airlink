@@ -1,142 +1,487 @@
-menu "Bitle hardware"
+menu "Airlink"
 
-    choice BITLE_LORA_BOARD
-        prompt "SX1262 board wiring"
-        depends on IDF_TARGET_ESP32S3
-        default BITLE_LORA_BOARD_XIAO_WIO_SX1262
-        help
-            Pin map for the LoRa trunk radio. The SX1262 is probed at boot
-            (scratch-register check), so a wrong or absent radio degrades
-            the node to BLE-only rather than failing.
+    menu "Board"
 
-            XIAO_WIO_SX1262: Seeed XIAO ESP32-S3 + Wio-SX1262 (B2B connector),
-            pins per the board's shipping Meshtastic variant.
+        choice AH_BOARD
+            prompt "Board"
+            default AH_BOARD_HELTEC_V4 if IDF_TARGET_ESP32S3
+            default AH_BOARD_C6_DEVKIT if IDF_TARGET_ESP32C6
+            help
+                The board's wiring: radio pins, RF front end, power rails and
+                display (docs/BOARDS.md gives each board's sources). Set by
+                config/board.<name>, which also sets the board's target,
+                flash size, PSRAM and console port.
 
-            HELTEC_V3: Heltec WiFi LoRa 32 V3 and Wireless Stick Lite V3
-            (identical radio wiring), pins per the MeshCore heltec_v3
-            variant. Also enables the Vext peripheral rail by default.
+            config AH_BOARD_HELTEC_V4
+                bool "Heltec WiFi LoRa 32 V4 (ESP32-S3R2, 2 MiB PSRAM)"
+                depends on IDF_TARGET_ESP32S3
+            config AH_BOARD_HELTEC_V4_R8
+                bool "Heltec WiFi LoRa 32 V4-R8 (ESP32-S3R8, 8 MiB PSRAM)"
+                depends on IDF_TARGET_ESP32S3
+            config AH_BOARD_HELTEC_V3
+                bool "Heltec WiFi LoRa 32 V3"
+                depends on IDF_TARGET_ESP32S3
+            config AH_BOARD_TBEAM_SUPREME
+                bool "LilyGO T-Beam Supreme"
+                depends on IDF_TARGET_ESP32S3
+            config AH_BOARD_XIAO_S3_WIO
+                bool "Seeed XIAO ESP32-S3 with the Wio-SX1262"
+                depends on IDF_TARGET_ESP32S3
+            config AH_BOARD_C6_DEVKIT
+                bool "ESP32-C6-DevKitC-1 (Bluetooth only)"
+                depends on IDF_TARGET_ESP32C6
+            config AH_BOARD_XIAO_C6
+                bool "Seeed XIAO ESP32-C6 (Bluetooth only)"
+                depends on IDF_TARGET_ESP32C6
+        endchoice
 
-        config BITLE_LORA_BOARD_XIAO_WIO_SX1262
-            bool "Seeed XIAO ESP32-S3 + Wio-SX1262"
+        config AH_BOARD_VEXT_ACTIVE_LOW
+            bool "Vext switches on when its control pin is driven low"
+            depends on AH_BOARD_HELTEC_V3 || AH_BOARD_HELTEC_V4 || AH_BOARD_HELTEC_V4_R8
+            default y
+            help
+                Heltec's own library and the Meshtastic variants both drive
+                Vext's control pin (GPIO36, GPIO40 on the V4-R8) low to power
+                Vext (the OLED, and the V4's receive LNA). Turn this off only
+                for a board revision measured to need the opposite.
 
-        config BITLE_LORA_BOARD_HELTEC_V3
-            bool "Heltec WiFi LoRa 32 V3 / Wireless Stick Lite V3"
-    endchoice
+        config AH_BOARD_XIAO_C6_EXTERNAL_ANTENNA
+            bool "Use the U.FL antenna port"
+            depends on AH_BOARD_XIAO_C6
+            default n
+            help
+                The XIAO ESP32-C6 switches between its ceramic antenna and
+                the U.FL port on GPIO14. Set this when an external antenna
+                is fitted.
 
-    config BITLE_LORA_VEXT_PIN
-        int "Peripheral power gate GPIO (-1 = none)"
-        depends on IDF_TARGET_ESP32S3
-        default 36 if BITLE_LORA_BOARD_HELTEC_V3
-        default -1
-        help
-            Some boards (Heltec V3) gate the radio behind a switchable
-            peripheral rail ("Vext"). GPIO number that enables the rail,
-            driven active-high at boot; -1 when the radio is always powered.
+        config AH_DISPLAY_ON_S
+            int "Seconds the display stays lit after boot or a button press"
+            range 0 600
+            default 30
+            help
+                0 never lights it. An OLED left on burns in and draws about
+                10 mA, a fifth of an idle node's budget on solar.
 
-    config BITLE_DISPLAY
-        bool "SSD1306 status display (auto-detected)"
-        depends on IDF_TARGET_ESP32S3
-        default y if BITLE_LORA_BOARD_HELTEC_V3
-        default n
-        help
-            128x64 OLED showing nickname, link/peer counts and a live
-            activity tape. Probed on I2C at boot; with no display present
-            the node runs headless. The OLED shares the Vext rail with the
-            radio on Heltec boards and powers it the same way.
+    endmenu
 
-    config BITLE_DISPLAY_PIN_SDA
-        int "Display I2C SDA GPIO"
-        depends on BITLE_DISPLAY
-        default 17
+    menu "LoRa trunk"
 
-    config BITLE_DISPLAY_PIN_SCL
-        int "Display I2C SCL GPIO"
-        depends on BITLE_DISPLAY
-        default 18
+        config AH_LORA_ANTENNA_GAIN_DDBI
+            int "Antenna gain, in tenths of a dBi"
+            range 0 150
+            default 30
+            help
+                The fitted antenna's gain. The conducted power is the region's
+                EIRP limit less this (docs/LORA.md), so understating it can
+                break the rule. The default, 3 dBi, covers the whips these
+                boards ship with; a higher-gain antenna must be entered here.
 
-    config BITLE_DISPLAY_PIN_RST
-        int "Display reset GPIO (-1 = none)"
-        depends on BITLE_DISPLAY
-        default 21
+        config AH_LORA_TASK_STACK
+            int "LoRa task stack, in bytes"
+            range 4096 16384
+            default 8192
+            help
+                The task tags and checks every trunk frame (HMAC-SHA256) and
+                derives a pair key (X25519) for each node it meets, on top of
+                a frame and its parse on the stack.
 
-    config BITLE_DISPLAY_BUTTON_PIN
-        int "User/wake button GPIO, active low (-1 = none)"
-        depends on BITLE_DISPLAY
-        default 0
+        config AH_LORA_TASK_PRIORITY
+            int "LoRa task priority"
+            range 1 20
+            default 6
+            help
+                Above the mesh task, so a radio interrupt is served while the
+                mesh is busy; below the Bluetooth host.
 
-    config BITLE_DISPLAY_ON_SECS
-        int "Display wake time after boot/button press (seconds)"
-        depends on BITLE_DISPLAY
-        default 10
+        config AH_TRUNK_ANNOUNCE_INTERVAL_S
+            int "Seconds between one sender's announces on the trunk"
+            range 60 3600
+            default 300
+            help
+                Phones announce every 15 to 30 s; the trunk carries one
+                announce per sender per interval, and a message always
+                brings its sender's announce ahead of it when none crossed
+                recently. A region allowing under 10 % of the air stretches
+                the interval in proportion: four times at 2.5 %, ten times
+                at 1 %.
 
-    config BITLE_LORA_DIAGNOSTIC_SMOKE
-        bool "Transmit LoRa diagnostic smoke packets"
-        depends on IDF_TARGET_ESP32S3
-        default n
-        help
-            Test-only mode. First transmit three spaced synthetic broadcasts
-            that exercise same-medium forwarding, then after an authenticated
-            v3 neighbor is discovered transmit addressed packets spanning one
-            through five fragments, followed by successful recovery probes
-            that exercise balanced-to-stable link adaptation. Flash exactly
-            one test node with this enabled and leave receiving nodes on the
-            normal build. Never enable it in deployed firmware.
+    endmenu
 
-    config BITLE_LORA_DIAGNOSTIC_QUIET
-        bool "Restrict LoRa TX to controlled diagnostic traffic"
-        depends on IDF_TARGET_ESP32S3
-        default n
-        help
-            Test-only mode for controlled PHY comparisons. Local LoRa data
-            admission guarantees one signed discovery announcement and
-            continues announcements until an authenticated neighbor is
-            learned, then limits data to marked diagnostic probes; beacons and
-            packet controls remain enabled and refresh the direct route.
-            Enable it on every board participating in a coding-rate or power
-            measurement. Never enable it in deployed firmware.
+    menu "Bluetooth"
 
-    choice BITLE_LORA_REGION
-        prompt "Default LoRa regional profile"
-        depends on IDF_TARGET_ESP32S3
-        default BITLE_LORA_REGION_US915
+        config AH_BLE_ADV_INTERVAL_MS
+            int "Advertising interval, in milliseconds"
+            range 20 10240
+            default 160
+            help
+                Phones scan in bursts; 160 ms is found within one burst while
+                costing a fraction of the 20 ms minimum's current.
 
-        config BITLE_LORA_REGION_US915
-            bool "US915 (902-928 MHz)"
+        config AH_BLE_NODE_LINKS
+            int "Links this node dials to other nodes"
+            range 0 4
+            default 2
 
-        config BITLE_LORA_REGION_EU868
-            bool "EU868 (863-870 MHz)"
-    endchoice
+        config AH_BLE_PHONE_SLOTS
+            int "Connection slots this node never dials into"
+            range 1 BT_NIMBLE_MAX_CONNECTIONS
+            default 4
+            help
+                With NimBLE's six connections, this node dials no more than
+                two to other nodes and never into these four. Nodes that dial
+                this one also take slots from them, so beside several other
+                nodes phones may find fewer. A node full refuses the next
+                connection, which then reaches the mesh another way.
 
-    config BITLE_LORA_DEFAULT_SF
-        int "Default LoRa spreading factor"
-        depends on IDF_TARGET_ESP32S3
-        range 7 12
-        default 10
+        config AH_BLE_SCAN_EVERY_S
+            int "Seconds between scans for other nodes"
+            range 10 3600
+            default 60
 
-    config BITLE_LORA_CODING_RATE
-        int "LoRa coding-rate denominator (4/x)"
-        depends on IDF_TARGET_ESP32S3
-        range 5 8
-        default 5
-        help
-            Global interoperable PHY setting. Every node on a trunk must use
-            the same value. Link adaptation never changes coding rate for one
-            peer; coordinated CR4/6 and CR4/7 test builds may override this
-            default on every participating board.
+        config AH_BLE_SCAN_FOR_MS
+            int "Length of each scan, in milliseconds"
+            range 500 30000
+            default 3000
 
-    config BITLE_LORA_PREAMBLE_SYMBOLS
-        int "LoRa preamble symbols"
-        depends on IDF_TARGET_ESP32S3
-        range 8 64
-        default 16
+        config AH_BLE_CODED_PHY
+            bool "Ask node-to-node links for LE Coded PHY"
+            depends on BT_NIMBLE_50_FEATURE_SUPPORT
+            default n
+            help
+                A request the link layer may decline, made once per link
+                after the peer's announce shows it is a node. Off until a
+                two-node test confirms it (docs/TESTING.md).
 
-    config BITLE_LORA_DIAGNOSTIC_SUPPRESS_TX_DONE_ONCE
-        bool "Suppress one TX_DONE event to exercise recovery"
-        depends on BITLE_LORA_DIAGNOSTIC_SMOKE
-        default n
-        help
-            Test-only fault injection. The LoRa task ignores its first TX_DONE
-            event so the independent software watchdog must reset the radio and
-            return it to continuous RX. Never enable it in deployed firmware.
+    endmenu
+
+    menu "Mesh tables"
+
+        comment "Defaults: a board with PSRAM gets the full tables (1.39 MiB, in PSRAM);"
+        comment "one without gets compact ones (118 to 123 KiB of internal RAM). docs/MEMORY.md."
+
+        config AH_LINKS
+            int "Open links (Bluetooth and LoRa together)"
+            range 2 32
+            default 14 if IDF_TARGET_ESP32S3
+            default 6
+            help
+                NimBLE's six connections plus, where there is a radio, the
+                trunk's eight neighbors.
+
+        config AH_QUEUE_PER_LINK
+            int "Frames queued per link"
+            range 4 64
+            default 24 if SPIRAM
+            default 12
+            help
+                A ceiling: a queue never holds more than a quarter of
+                AH_FRAME_BUFFERS (at least 4), so links the transport keeps
+                busy cannot hold every buffer between them. Anything still
+                queued after 10 s (5 minutes on a LoRa link) is dropped.
+
+        config AH_FRAME_BUFFERS
+            int "Shared frame buffers"
+            range 16 1024
+            default 256 if SPIRAM
+            default 24
+            help
+                518 bytes each: 24 is 12 KiB of internal RAM, 256 is 130 KiB
+                of PSRAM. A frame bound for several links takes one buffer.
+                Relays leave 4 free, so the node's own announces, replies and
+                handovers always find one.
+
+        config AH_PEERS
+            int "Peers remembered"
+            range 16 1024
+            default 256 if SPIRAM
+            default 32
+            help
+                112 bytes each. The oldest unlinked peer goes first.
+
+        config AH_PEER_PINS
+            int "Signing keys kept for peers given up"
+            range 0 4096
+            default 1024 if SPIRAM
+            default 256
+            help
+                16 bytes each. A peer the table gives up, for room or after
+                its verified leave, leaves its signing key here, so an
+                announce of its public Noise key under another signing key
+                is refused when it returns, as bitchat-ios refuses one from
+                the identities it persists. A key lasts until this many more
+                peers have been given up: taking over a departed peer's
+                identity first needs this many fresh identities to verify,
+                each a check from the signature budget. 0 keeps none.
+
+        config AH_DEDUP_MESSAGE_SLOTS
+            int "Message dedup slots"
+            range 256 65536
+            default 4096 if SPIRAM
+            default 1024
+            help
+                8 bytes each, sized at twice the IDs held over the 5 minute
+                window: 4096 slots hold 2048 IDs, twice Airhop's 1000 entries.
+                Without PSRAM, 1024 slots hold 512 IDs, one message every
+                0.6 s; past that a repeat may be forwarded once more.
+
+        config AH_DEDUP_FRAGMENT_SLOTS
+            int "Fragment dedup slots"
+            range 256 65536
+            default 8192 if SPIRAM
+            default 1024
+            help
+                A 1 MiB file is about 2,300 fragments: 8192 slots hold all of
+                them over the 5 minute window. 1024 slots, without PSRAM,
+                hold 512; past that a repeated fragment may be forwarded
+                twice, which costs airtime but never breaks a transfer.
+
+        config AH_DEDUP_LIVE_SLOTS
+            int "Live voice and video dedup slots"
+            range 256 65536
+            default 16384 if SPIRAM
+            default 1024
+            help
+                The window is 150 s (30 s of age plus the 2 minute skew).
+                A Bluetooth hop paces a video stream to 24 packets a second
+                (PROTOCOLS section 4), so 16384 slots cover two streams and
+                voice, 54 packets a second, for the whole window. Without
+                PSRAM, 1024 slots cover one stream for 21 s; a frame older
+                than 30 s is refused anyway once the clock is set, so a
+                repeat in between may be forwarded once more.
+
+        config AH_SYNC_ANNOUNCES
+            int "Announces kept for gossip sync"
+            range 8 4096
+            default 256 if SPIRAM
+            default 12
+        config AH_SYNC_ANNOUNCE_KIB
+            int "KiB for those announces"
+            range 2 1024
+            default 64 if SPIRAM
+            default 3
+        config AH_SYNC_MESSAGES
+            int "Public messages kept for gossip sync"
+            range 16 8192
+            default 512 if SPIRAM
+            default 32
+        config AH_SYNC_MESSAGE_KIB
+            int "KiB for those messages"
+            range 4 4096
+            default 256 if SPIRAM
+            default 8
+        config AH_SYNC_GROUPS
+            int "Group messages kept for gossip sync"
+            range 4 4096
+            default 128 if SPIRAM
+            default 8
+        config AH_SYNC_GROUP_KIB
+            int "KiB for those group messages"
+            range 2 1024
+            default 64 if SPIRAM
+            default 2
+        config AH_SYNC_BOARD
+            int "Board posts kept for gossip sync"
+            range 4 4096
+            default 256 if SPIRAM
+            default 12
+            help
+                One store per kind, so a busy room never evicts the board.
+                Without PSRAM the four stores take 26 KiB with their index
+                and scratch, against 580 KiB on a PSRAM board.
+        config AH_SYNC_BOARD_KIB
+            int "KiB for those board posts"
+            range 2 2048
+            default 128 if SPIRAM
+            default 3
+        config AH_SYNC_DECLINED
+            int "Packet IDs remembered as declined"
+            range 8 1024
+            default 64 if SPIRAM
+            default 16
+
+        config AH_SYNC_REPLY_BACKLOG
+            int "Planned sync replies held per link"
+            range 8 512
+            default 64 if SPIRAM
+            default 16
+
+        config AH_MAIL_SLOTS
+            int "Courier envelopes held"
+            range 2 1024
+            default 64 if SPIRAM
+            default 4
+        config AH_MAIL_KIB
+            int "KiB for courier envelopes"
+            range 4 4096
+            default 256 if SPIRAM
+            default 8
+            help
+                Keep it at least AH_BIG_SEND_KIB, so the largest envelope
+                fits. The flash copy is an NVS partition sized to hold the
+                PSRAM default.
+        config AH_MAIL_PER_DEPOSITOR
+            int "Envelopes one depositor may hold"
+            range 1 64
+            default 4 if SPIRAM
+            default 2
+            help
+                Past it a deposit is refused, as Airhop and bitchat-ios
+                refuse one, and the depositor keeps carrying it. Two lets a
+                sender's two queued messages both in, as at an Airhop phone.
+        config AH_MAIL_FLASH_KIB_PER_HOUR
+            int "KiB the mailbox may write to flash in an hour"
+            range 16 4096
+            default 1024 if SPIRAM
+            default 256
+            help
+                Deposits and the spray budgets written back after a spray,
+                each charged its envelope plus 128 bytes of NVS bookkeeping.
+                Past it, deposits are refused until the hour is up, so no
+                deposit rate wears the mailbox partition faster. Its 4 KiB
+                pages are rated for 100,000 erases: at the default without
+                pause that is about 17 years on the 8 MiB layout holding
+                256 KiB of mail, and over 30 on the 4 MiB layout with the
+                compact set (docs/MEMORY.md has the arithmetic). Heavy
+                honest use, 1,000 deposits a day of 2 KiB each sprayed
+                twice, writes about a quarter of the PSRAM default. Keep
+                it well above AH_BIG_SEND_KIB, or the largest envelopes
+                are never taken. One depositor may write only its share,
+                this times AH_MAIL_PER_DEPOSITOR over AH_MAIL_SLOTS (64 KiB
+                an hour with PSRAM, 128 KiB without), and the build refuses
+                a share too small for the largest envelope.
+
+        config AH_REASSEMBLY_SLOTS
+            int "Fragmented packets reassembled at once"
+            range 1 16
+            default 4 if SPIRAM
+            default 1
+            help
+                For the node's own use only (mail, sync storage); relaying
+                never waits on it. AH_BIG_SEND_KIB each.
+
+        config AH_BIG_SEND_KIB
+            int "Largest packet the node reassembles or sends in fragments, in KiB"
+            range 2 64
+            default 17 if SPIRAM
+            default 4
+            help
+                17 KiB holds a courier envelope at the protocol's 16 KiB
+                ceiling with its header and signature. Without PSRAM, 4 KiB:
+                the node holds and hands over envelopes up to about 4 KiB
+                (any text DM) and refuses larger ones, counted, which their
+                sender then carries itself.
+
+        config AH_INFLATE_WINDOW_KIB
+            int "Inflate window, in KiB"
+            range 1 32
+            default 32 if SPIRAM
+            default 4
+            help
+                32 KiB, DEFLATE's own window, inflates any payload. A smaller
+                one saves its difference in internal RAM and refuses (counts,
+                does not relay) a compressed packet that decodes past it: a
+                single Bluetooth frame decoding past 4 KiB compressed better
+                than 8 to 1, which real text does not.
+
+        config AH_RELAY_SLOTS
+            int "Relays waiting out their jitter"
+            range 16 1024
+            default 128 if SPIRAM
+            default 32
+
+        config AH_SESSIONS
+            int "Noise sessions with peers that message the node"
+            range 1 32
+            default 8 if SPIRAM
+            default 2
+
+        config AH_VERIFY_PER_SECOND
+            int "Signature checks per second"
+            range 5 2000
+            default 8 if IDF_TARGET_ESP32S3
+            default 13
+            help
+                The default spends about a quarter of a core on checks.
+                Monocypher's Ed25519 check took 4.86 M cycles on the
+                original ESP32's Xtensa core and 3.01 M on a 32-bit RISC-V
+                core (Banegas et al., "Quantum-Resistant Security for
+                Software Updates on Low-power Networked Embedded Devices",
+                2021, Tables 5 and 6): at the 160 MHz both chips run at,
+                about 30 ms on the S3 and 19 ms on the C6, so 8 and 13
+                checks cost about 245 ms a second of the core the mesh task
+                runs on. The budget's window is a fixed second, so where two
+                windows meet up to twice that runs back to back, about half
+                a core for that second. These chips' own timings are
+                unmeasured: check `short of: verify` and `longest mesh pass`
+                on the board (docs/TESTING.md).
+                Each check is charged to the link its packet came over, and
+                each open link is held an even share of the second (at least
+                one check, and only one while it has been quiet for two
+                seconds), so a flood on one link cannot starve the others.
+                What no link is held goes to whoever asks, but the node's
+                own checks (announces, messages it keeps, requests,
+                deposits) leave a quarter of their link's share, and of the
+                budget, to the checks that decide whether a packet is
+                relayed.
+
+        config AH_INFLATE_KIB_PER_SECOND
+            int "KiB per second inflated to read compressed packets"
+            range 64 8192
+            default 512
+            help
+                A compressed packet is let in on the size it claims and
+                charged the bytes it actually inflated to, so a stream that
+                fails at once costs next to nothing. Shared between the
+                links as the signature budget is, with 4 KiB a second held
+                for a quiet link.
+
+    endmenu
+
+    menu "Tasks"
+
+        config AH_EVENT_QUEUE
+            int "Transport events queued for the mesh task"
+            range 8 256
+            default 32 if SPIRAM
+            default 16
+            help
+                About 520 bytes each, internal RAM. A full queue drops the
+                event and counts it.
+
+        config AH_MESH_TASK_STACK
+            int "Mesh task stack, in bytes"
+            range 6144 32768
+            default 8192
+
+        config AH_MESH_TASK_PRIORITY
+            int "Mesh task priority"
+            range 1 20
+            default 5
+
+    endmenu
+
+    menu "Updates"
+
+        config AH_OTA_TRIAL_MIN
+            int "Minutes an image on trial runs before a verified link keeps it"
+            range 1 1440
+            default 15
+            help
+                An updated image is kept once it has run this long and a
+                neighbor's announce has verified over a live link: long
+                enough to reach the first clock save, mail write, LoRa beacon
+                and sync rounds, so an image that crashes at one rolls back
+                rather than being kept and offered on.
+
+        config AH_OTA_TRIAL_FALLBACK_MIN
+            int "Minutes before an image on trial is kept without a verified link"
+            range 5 1440
+            default 30
+            help
+                A node with no one around keeps the image after this long
+                without a crash, so its next power cut does not roll it back.
+                Keep it at or above AH_OTA_TRIAL_MIN.
+
+    endmenu
 
 endmenu

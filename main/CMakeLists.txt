@@ -1,41 +1,12 @@
+set(first_party "app_main.c" "ah_app.c" "ah_console.c" "ah_mailbox.c" "ah_ota.c" "ah_settings.c")
+# espcoredump: the console reads and erases the last crash. It must be required
+# anyway, so that MINIMAL_BUILD builds it, without which its Kconfig never loads
+# and no core dump is written.
 idf_component_register(
-    SRCS
-        "main.c"
-        "bitchat_ble.c"
-        "noise_handshake.c"
-        "packet_codec.c"
-        "nickname_manager.c"
-        "bitle_hash.c"
-        "bitle_link.c"
-        "bitle_mesh.c"
-        "bitle_route.c"
-        "bitle_lora.c"
-        "lora_airtime.c"
-        "lora_channel_policy.c"
-        "lora_forwarding.c"
-        "lora_link_adaptation.c"
-        "lora_packet_reliability.c"
-        "lora_region.c"
-        "lora_trunk_protocol.c"
-        "lora_tx_scheduler.c"
-        "sx1262.c"
-        "bitle_ota.c"
-        "bitle_store.c"
-        "bitle_courier.c"
-        "bitle_sync.c"
-        "bitle_stats.c"
-        "bitle_screen.c"
-        "bitle_display.c"
+    SRCS ${first_party}
     INCLUDE_DIRS "."
-    REQUIRES bt nvs_flash noise_ref mbedtls bitchat_utils app_update esp_partition esp_driver_gpio esp_driver_spi esp_driver_i2c
-)
-
-target_include_directories(${COMPONENT_LIB} PRIVATE
-    $ENV{IDF_PATH}/components/bt/host/nimble/nimble/nimble/include
-    $ENV{IDF_PATH}/components/bt/host/nimble/nimble/nimble/host/include
-    $ENV{IDF_PATH}/components/bt/host/nimble/nimble/porting/nimble/include
-    $ENV{IDF_PATH}/components/bt/host/nimble/port/include
-    $ENV{IDF_PATH}/components/bt/host/nimble/nimble/porting/npl/freertos/include
-    $ENV{IDF_PATH}/components/bt/host/nimble/nimble/nimble/transport/include
-    $ENV{IDF_PATH}/components/bt/host/nimble/esp-hci/include
-)
+    PRIV_REQUIRES ah_mesh ah_ble ah_lora ah_board ah_crypto ah_proto
+                  nvs_flash app_update esp_partition esp_app_format esp_timer esp_pm console bootloader_support efuse
+                  espcoredump)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/ah_component.cmake)
+ah_first_party(${first_party})

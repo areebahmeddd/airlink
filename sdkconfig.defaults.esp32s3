@@ -1,1 +1,3 @@
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# The controller counts connections, scanning and advertising together: six
+# links, one scan and one advertising set.
+CONFIG_BT_CTRL_BLE_MAX_ACT=8
