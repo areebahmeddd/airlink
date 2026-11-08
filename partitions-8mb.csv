@@ -1,0 +1,13 @@
+# Airlink partitions for 8 MiB of flash or more (docs/MEMORY.md). The table
+# sits at 0x10000 (CONFIG_PARTITION_TABLE_OFFSET), leaving room for a
+# bootloader with Secure Boot and flash encryption. Changing it means
+# re-flashing by wire: settle it before deploying.
+# Name,    Type, SubType,  Offset,   Size
+nvs,       data, nvs,      0x11000,  0x7000
+otadata,   data, ota,      0x18000,  0x2000
+manifest,  data, 0x40,     0x1a000,  0x1000
+nvs_keys,  data, nvs_keys, 0x1b000,  0x1000,  encrypted
+ota_0,     app,  ota_0,    0x20000,  0x300000
+ota_1,     app,  ota_1,    0x320000, 0x300000
+mailbox,   data, nvs,      0x620000, 0x1d0000
+coredump,  data, coredump, 0x7f0000, 0x10000, encrypted
