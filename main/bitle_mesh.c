@@ -11,6 +11,8 @@
 #include "bitchat_time.h"
 #include "bitle_link.h"
 #include "bitle_ota.h"
+#include "bitle_route.h"
+#include "bitle_stats.h"
 #include "bitle_sync.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
@@ -233,8 +235,15 @@ static void dispatch_packet(uint16_t link_handle, const bitchat_packet_t *packet
 }
 
 /* --- Mesh relay -----------------------------------------------------------
- * Forwards packets between links: TTL-decremented, deduplicated raw
- * re-broadcast of everything not addressed to (or sent by) this node. */
+ * Mirrors upstream PacketRelayManager.handlePacketRelay: packets addressed
+ * to (or sent by) this node are never relayed, TTL 0 stops forwarding, and
+ * the TTL is decremented before any forwarding. A v2 source route (flag
+ * 0x08) gets targeted next-hop forwarding — we forward only when we appear
+ * in the route, toward the next hop (or the final recipient when we are the
+ * last hop), with the signed route left byte-intact; when the next hop is
+ * not directly connected we fall back to flooding. Unrouted packets flood
+ * to every link except the ingress link and the original sender's own link.
+ * REQUEST_SYNC and undirected handshakes stay link-local (Bitle hardening). */
 
 #define RELAY_CACHE_SIZE 64
 
@@ -244,7 +253,8 @@ static size_t s_relay_seen_next;
 static uint64_t relay_fingerprint(const uint8_t *data, size_t len)
 {
     /* FNV-1a over the packet bytes, skipping the TTL byte (offset 2), which
-     * changes at every hop and must not defeat deduplication. */
+     * changes at every hop and must not defeat deduplication. The route is
+     * signed and forwarded intact, so it needs no such treatment. */
     uint64_t hash = 1469598103934665603ULL;
     for (size_t i = 0; i < len; ++i) {
         if (i == 2) {
@@ -268,19 +278,69 @@ static bool relay_seen_before(uint64_t fingerprint)
     return false;
 }
 
+/* Source-route forwarding (upstream: route present, we are a listed hop).
+ * Returns true when the packet was unicast toward its next hop; false means
+ * "fall back to flooding". */
+static bool relay_along_route(uint16_t src_link, uint8_t *buffer, uint16_t len, const bitchat_packet_t *packet)
+{
+    (void)src_link;
+    /* Duplicate hops mean a routing loop; upstream drops the packet. */
+    for (uint8_t i = 0; i < packet->route_count; ++i) {
+        for (uint8_t j = i + 1; j < packet->route_count; ++j) {
+            if (memcmp(packet->route[i], packet->route[j], 8) == 0) {
+                ESP_LOGW(TAG, "Route with duplicate hops dropped");
+                return true; /* handled: dropped */
+            }
+        }
+    }
+    const uint8_t *me = noise_get_local_peer_id();
+    int index = -1;
+    for (uint8_t i = 0; i < packet->route_count; ++i) {
+        if (memcmp(packet->route[i], me, 8) == 0) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0) {
+        return false; /* not our hop: the flood path takes it */
+    }
+    const uint8_t *next;
+    if (index + 1 < packet->route_count) {
+        next = packet->route[index + 1];
+    } else if (packet->has_recipient) {
+        next = packet->recipient_id; /* last intermediate: deliver to the recipient */
+    } else {
+        return false;
+    }
+    uint16_t link = bitle_route_link_for(next);
+    if (link == BITLE_LINK_NONE) {
+        ESP_LOGW(TAG, "Route next hop %02X%02X.. not directly connected; flooding",
+                 next[0], next[1]);
+        return false;
+    }
+    if (bitle_link_send(link, buffer, len) != ESP_OK) {
+        return false;
+    }
+    bitle_stats_note_tx();
+    bitle_stats_note_activity(BITLE_LANE_FWD, 1);
+    ESP_LOGI(TAG, "Route-relay type=0x%02X ttl=%u -> %02X%02X%02X%02X.. link=%u",
+             packet->type, buffer[2], next[0], next[1], next[2], next[3], link);
+    return true;
+}
+
 static void relay_packet(uint16_t src_link, uint8_t *buffer, uint16_t len, const bitchat_packet_t *packet)
 {
-    if (packet->ttl <= 1) {
-        return;
+    if (is_local_recipient(packet)) {
+        return; /* addressed to us; nothing to forward */
     }
     if (memcmp(packet->sender_id, noise_get_local_peer_id(), sizeof(packet->sender_id)) == 0) {
         return; /* our own packet echoed back */
     }
+    if (packet->ttl == 0) {
+        return; /* expired */
+    }
     if (packet->type == BITCHAT_MSG_REQUEST_SYNC) {
         return; /* link-local by protocol */
-    }
-    if (is_local_recipient(packet)) {
-        return; /* addressed to us; nothing to forward */
     }
     if (!packet->has_recipient && packet->type == BITCHAT_MSG_NOISE_HANDSHAKE) {
         return; /* undirected handshakes are link-local */
@@ -288,8 +348,29 @@ static void relay_packet(uint16_t src_link, uint8_t *buffer, uint16_t len, const
 
     buffer[2] = packet->ttl - 1;
 
-    int forwarded = bitle_link_broadcast(src_link, buffer, len);
+    if (packet->has_route && packet->route_count > 0 && !packet->route_truncated) {
+        if (relay_along_route(src_link, buffer, len, packet)) {
+            return;
+        }
+    }
+
+    /* Flood: every link except the one it arrived on and the sender's own
+     * point-to-point link. A broadcast-medium mapping (LoRa trunk) must NOT
+     * suppress forwarding: the packet may have reached us over another path
+     * and the trunk's other listeners still need it. */
+    uint16_t sender_link = bitle_route_link_for(packet->sender_id);
+    if (sender_link != BITLE_LINK_NONE && bitle_link_is_broadcast(sender_link)) {
+        sender_link = BITLE_LINK_NONE;
+    }
+    int forwarded =
+        bitle_link_type_of(src_link) == BITLE_LINK_LORA
+            ? bitle_link_rebroadcast(
+                  src_link, sender_link, buffer, len)
+            : bitle_link_broadcast(
+                  src_link, sender_link, buffer, len);
     if (forwarded > 0) {
+        bitle_stats_note_tx();
+        bitle_stats_note_activity(BITLE_LANE_FWD, 1);
         ESP_LOGI(TAG, "Relayed type=0x%02X ttl=%u to %d link(s)", packet->type, buffer[2], forwarded);
     }
 }
@@ -315,10 +396,27 @@ bool bitle_mesh_inbound(uint16_t link_handle, uint8_t *buffer, uint16_t len)
      * link, and every reply then exits the wrong interface. Retries are
      * never byte-identical (fresh timestamps/nonces), so they pass. */
     if (relay_seen_before(relay_fingerprint(buffer, len))) {
+        /* Upstream re-admits announces still at their origin TTL past dedup
+         * (SecurityManager): the same announce races through several paths
+         * at once, and if a relayed copy won, the direct copy — the only
+         * proof of who is directly connected — must still be processed.
+         * The duplicate is dispatched locally only: never re-relayed,
+         * never re-ingested into the sync store. */
+        if (packet.type == BITCHAT_MSG_ANNOUNCE && packet.ttl == BITLE_ORIGIN_TTL) {
+            dispatch_packet(link_handle, &packet);
+        }
         xSemaphoreGive(s_lock);
         ESP_LOGD(TAG, "duplicate packet dropped (type=0x%02X)", packet.type);
         bitchat_packet_free(&packet);
         return true;
+    }
+    /* Display bookkeeping: unique arrivals by link, discovered announce
+     * senders (direct and relayed alike). */
+    bitle_stats_note_rx();
+    bitle_stats_note_activity(
+        bitle_link_type_of(link_handle) == BITLE_LINK_LORA ? BITLE_LANE_TRUNK : BITLE_LANE_BLE, 0);
+    if (packet.type == BITCHAT_MSG_ANNOUNCE) {
+        bitle_stats_note_peer(packet.sender_id);
     }
     dispatch_packet(link_handle, &packet);
     /* Dead-drop: keep recent signed public packets so passing phones can

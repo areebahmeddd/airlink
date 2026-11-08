@@ -190,7 +190,8 @@ static int link_send(ble_conn_state_t *state, const uint8_t *data, uint16_t len)
  * knowing they are BLE. Called from the LoRa task, so snapshot the connection
  * fields under the lock, then do the (internally thread-safe) NimBLE call
  * outside it — never touching s_connections while teardown may be memsetting. */
-static int ble_link_send_cb(uint16_t handle, const uint8_t *data, uint16_t len)
+static bitle_link_send_result_t ble_link_send_cb(
+    uint16_t handle, const uint8_t *data, uint16_t len)
 {
     taskENTER_CRITICAL(&s_conn_mux);
     ble_conn_state_t *state = find_conn(handle);
@@ -201,19 +202,93 @@ static int ble_link_send_cb(uint16_t handle, const uint8_t *data, uint16_t len)
     taskEXIT_CRITICAL(&s_conn_mux);
 
     if (!ready) {
-        return BLE_HS_ENOTCONN;
+        return BITLE_LINK_SEND_FAILED;
     }
+    int rc;
     if (is_central) {
         if (!remote_val) {
-            return BLE_HS_EINVAL;
+            return BITLE_LINK_SEND_FAILED;
         }
-        return ble_gattc_write_no_rsp_flat(conn_handle, remote_val, data, len);
+        rc = ble_gattc_write_no_rsp_flat(conn_handle, remote_val, data, len);
+    } else {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
+        if (!om) {
+            return BITLE_LINK_SEND_DEFERRED;
+        }
+        rc = ble_gattc_notify_custom(conn_handle, s_tx_val_handle, om);
     }
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
+    if (rc == 0) {
+        return BITLE_LINK_SEND_ACCEPTED;
+    }
+    return rc == BLE_HS_ENOMEM ? BITLE_LINK_SEND_DEFERRED
+                               : BITLE_LINK_SEND_FAILED;
+}
+
+static bitle_link_send_result_t ble_link_reserve_cb(
+    uint16_t handle, uint8_t packet_type, uintptr_t *out_token)
+{
+    (void)packet_type;
+    if (!out_token) {
+        return BITLE_LINK_SEND_FAILED;
+    }
+    taskENTER_CRITICAL(&s_conn_mux);
+    ble_conn_state_t *state = find_conn(handle);
+    bool ready = state && state->subscribed;
+    taskEXIT_CRITICAL(&s_conn_mux);
+    if (!ready) {
+        return BITLE_LINK_SEND_FAILED;
+    }
+    static const uint8_t empty[BITCHAT_BLE_MAX_PACKET_SIZE];
+    struct os_mbuf *om =
+        ble_hs_mbuf_from_flat(empty, sizeof(empty));
     if (!om) {
-        return BLE_HS_ENOMEM;
+        return BITLE_LINK_SEND_DEFERRED;
     }
-    return ble_gattc_notify_custom(conn_handle, s_tx_val_handle, om);
+    *out_token = (uintptr_t)om;
+    return BITLE_LINK_SEND_ACCEPTED;
+}
+
+static bitle_link_send_result_t ble_link_commit_cb(
+    uint16_t handle, uintptr_t token, const uint8_t *data, uint16_t len)
+{
+    struct os_mbuf *om = (struct os_mbuf *)token;
+    if (!om || !data || len == 0 || len > BITCHAT_BLE_MAX_PACKET_SIZE) {
+        os_mbuf_free_chain(om);
+        return BITLE_LINK_SEND_FAILED;
+    }
+    if (os_mbuf_copyinto(om, 0, data, len) != 0) {
+        os_mbuf_free_chain(om);
+        return BITLE_LINK_SEND_FAILED;
+    }
+    os_mbuf_adj(om, -(int)(BITCHAT_BLE_MAX_PACKET_SIZE - len));
+
+    taskENTER_CRITICAL(&s_conn_mux);
+    ble_conn_state_t *state = find_conn(handle);
+    bool ready = state && state->subscribed;
+    bool is_central = ready && state->is_central;
+    uint16_t conn_handle = ready ? state->conn_handle : 0;
+    uint16_t remote_val = ready ? state->remote_val_handle : 0;
+    taskEXIT_CRITICAL(&s_conn_mux);
+    if (!ready || (is_central && !remote_val)) {
+        os_mbuf_free_chain(om);
+        return BITLE_LINK_SEND_FAILED;
+    }
+    int rc = is_central
+                 ? ble_gattc_write_no_rsp(conn_handle, remote_val, om)
+                 : ble_gattc_notify_custom(conn_handle, s_tx_val_handle, om);
+    if (rc == 0) {
+        return BITLE_LINK_SEND_ACCEPTED;
+    }
+    return rc == BLE_HS_ENOMEM ? BITLE_LINK_SEND_DEFERRED
+                               : BITLE_LINK_SEND_FAILED;
+}
+
+static void ble_link_cancel_cb(uint16_t handle, uintptr_t token)
+{
+    (void)handle;
+    if (token) {
+        os_mbuf_free_chain((struct os_mbuf *)token);
+    }
 }
 
 static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -335,7 +410,9 @@ static int central_cccd_written(uint16_t conn_handle, const struct ble_gatt_erro
     state->subscribed = true;
     ESP_LOGI(TAG, "conn=%u bitle-to-bitle link ready (val_handle=%u)",
              conn_handle, state->remote_val_handle);
-    bitle_link_register(conn_handle, BITLE_LINK_BLE, ble_link_send_cb);
+    bitle_link_register_reservable(
+        conn_handle, BITLE_LINK_BLE, ble_link_send_cb,
+        ble_link_reserve_cb, ble_link_commit_cb, ble_link_cancel_cb);
     noise_notify_subscribed(conn_handle);
     return 0;
 }
@@ -535,7 +612,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                  event->subscribe.cur_notify,
                  event->subscribe.cur_indicate);
         if (state && state->subscribed && !was_subscribed) {
-            bitle_link_register(event->subscribe.conn_handle, BITLE_LINK_BLE, ble_link_send_cb);
+            bitle_link_register_reservable(
+                event->subscribe.conn_handle, BITLE_LINK_BLE,
+                ble_link_send_cb, ble_link_reserve_cb,
+                ble_link_commit_cb, ble_link_cancel_cb);
             noise_notify_subscribed(event->subscribe.conn_handle);
         } else if (state && !state->subscribed && was_subscribed) {
             bitle_link_unregister(event->subscribe.conn_handle);
@@ -683,6 +763,19 @@ bool bitchat_ble_conn_is_central(uint16_t conn_handle)
 {
     ble_conn_state_t *state = find_conn(conn_handle);
     return state && state->is_central;
+}
+
+int bitchat_ble_link_count(void)
+{
+    int count = 0;
+    portENTER_CRITICAL(&s_conn_mux);
+    for (size_t i = 0; i < BITLE_BLE_MAX_CONNECTIONS; ++i) {
+        if (s_connections[i].in_use) {
+            count++;
+        }
+    }
+    portEXIT_CRITICAL(&s_conn_mux);
+    return count;
 }
 
 void bitchat_ble_disconnect(uint16_t conn_handle)

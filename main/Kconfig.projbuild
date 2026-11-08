@@ -1,0 +1,142 @@
+menu "Bitle hardware"
+
+    choice BITLE_LORA_BOARD
+        prompt "SX1262 board wiring"
+        depends on IDF_TARGET_ESP32S3
+        default BITLE_LORA_BOARD_XIAO_WIO_SX1262
+        help
+            Pin map for the LoRa trunk radio. The SX1262 is probed at boot
+            (scratch-register check), so a wrong or absent radio degrades
+            the node to BLE-only rather than failing.
+
+            XIAO_WIO_SX1262: Seeed XIAO ESP32-S3 + Wio-SX1262 (B2B connector),
+            pins per the board's shipping Meshtastic variant.
+
+            HELTEC_V3: Heltec WiFi LoRa 32 V3 and Wireless Stick Lite V3
+            (identical radio wiring), pins per the MeshCore heltec_v3
+            variant. Also enables the Vext peripheral rail by default.
+
+        config BITLE_LORA_BOARD_XIAO_WIO_SX1262
+            bool "Seeed XIAO ESP32-S3 + Wio-SX1262"
+
+        config BITLE_LORA_BOARD_HELTEC_V3
+            bool "Heltec WiFi LoRa 32 V3 / Wireless Stick Lite V3"
+    endchoice
+
+    config BITLE_LORA_VEXT_PIN
+        int "Peripheral power gate GPIO (-1 = none)"
+        depends on IDF_TARGET_ESP32S3
+        default 36 if BITLE_LORA_BOARD_HELTEC_V3
+        default -1
+        help
+            Some boards (Heltec V3) gate the radio behind a switchable
+            peripheral rail ("Vext"). GPIO number that enables the rail,
+            driven active-high at boot; -1 when the radio is always powered.
+
+    config BITLE_DISPLAY
+        bool "SSD1306 status display (auto-detected)"
+        depends on IDF_TARGET_ESP32S3
+        default y if BITLE_LORA_BOARD_HELTEC_V3
+        default n
+        help
+            128x64 OLED showing nickname, link/peer counts and a live
+            activity tape. Probed on I2C at boot; with no display present
+            the node runs headless. The OLED shares the Vext rail with the
+            radio on Heltec boards and powers it the same way.
+
+    config BITLE_DISPLAY_PIN_SDA
+        int "Display I2C SDA GPIO"
+        depends on BITLE_DISPLAY
+        default 17
+
+    config BITLE_DISPLAY_PIN_SCL
+        int "Display I2C SCL GPIO"
+        depends on BITLE_DISPLAY
+        default 18
+
+    config BITLE_DISPLAY_PIN_RST
+        int "Display reset GPIO (-1 = none)"
+        depends on BITLE_DISPLAY
+        default 21
+
+    config BITLE_DISPLAY_BUTTON_PIN
+        int "User/wake button GPIO, active low (-1 = none)"
+        depends on BITLE_DISPLAY
+        default 0
+
+    config BITLE_DISPLAY_ON_SECS
+        int "Display wake time after boot/button press (seconds)"
+        depends on BITLE_DISPLAY
+        default 10
+
+    config BITLE_LORA_DIAGNOSTIC_SMOKE
+        bool "Transmit LoRa diagnostic smoke packets"
+        depends on IDF_TARGET_ESP32S3
+        default n
+        help
+            Test-only mode. First transmit three spaced synthetic broadcasts
+            that exercise same-medium forwarding, then after an authenticated
+            v3 neighbor is discovered transmit addressed packets spanning one
+            through five fragments, followed by successful recovery probes
+            that exercise balanced-to-stable link adaptation. Flash exactly
+            one test node with this enabled and leave receiving nodes on the
+            normal build. Never enable it in deployed firmware.
+
+    config BITLE_LORA_DIAGNOSTIC_QUIET
+        bool "Restrict LoRa TX to controlled diagnostic traffic"
+        depends on IDF_TARGET_ESP32S3
+        default n
+        help
+            Test-only mode for controlled PHY comparisons. Local LoRa data
+            admission guarantees one signed discovery announcement and
+            continues announcements until an authenticated neighbor is
+            learned, then limits data to marked diagnostic probes; beacons and
+            packet controls remain enabled and refresh the direct route.
+            Enable it on every board participating in a coding-rate or power
+            measurement. Never enable it in deployed firmware.
+
+    choice BITLE_LORA_REGION
+        prompt "Default LoRa regional profile"
+        depends on IDF_TARGET_ESP32S3
+        default BITLE_LORA_REGION_US915
+
+        config BITLE_LORA_REGION_US915
+            bool "US915 (902-928 MHz)"
+
+        config BITLE_LORA_REGION_EU868
+            bool "EU868 (863-870 MHz)"
+    endchoice
+
+    config BITLE_LORA_DEFAULT_SF
+        int "Default LoRa spreading factor"
+        depends on IDF_TARGET_ESP32S3
+        range 7 12
+        default 10
+
+    config BITLE_LORA_CODING_RATE
+        int "LoRa coding-rate denominator (4/x)"
+        depends on IDF_TARGET_ESP32S3
+        range 5 8
+        default 5
+        help
+            Global interoperable PHY setting. Every node on a trunk must use
+            the same value. Link adaptation never changes coding rate for one
+            peer; coordinated CR4/6 and CR4/7 test builds may override this
+            default on every participating board.
+
+    config BITLE_LORA_PREAMBLE_SYMBOLS
+        int "LoRa preamble symbols"
+        depends on IDF_TARGET_ESP32S3
+        range 8 64
+        default 16
+
+    config BITLE_LORA_DIAGNOSTIC_SUPPRESS_TX_DONE_ONCE
+        bool "Suppress one TX_DONE event to exercise recovery"
+        depends on BITLE_LORA_DIAGNOSTIC_SMOKE
+        default n
+        help
+            Test-only fault injection. The LoRa task ignores its first TX_DONE
+            event so the independent software watchdog must reset the radio and
+            return it to continuous RX. Never enable it in deployed firmware.
+
+endmenu

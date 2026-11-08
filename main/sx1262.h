@@ -15,6 +15,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "lora_region.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,11 +33,20 @@ typedef struct {
     int pin_dio1;
     int pin_rxen;      /* -1 if not board-controlled */
     uint32_t freq_hz;
-    uint8_t sf;        /* 5..12 */
+    uint8_t sf;        /* 7..12 */
     uint32_t bw_hz;    /* 125000 / 250000 / 500000 */
     uint8_t cr;        /* 5..8 => 4/5..4/8 */
+    uint16_t preamble_symbols;
     int8_t tx_dbm;     /* up to +22 */
+    lora_region_id_t region;
 } sx1262_config_t;
+
+typedef struct {
+    uint32_t command_errors;
+    uint32_t busy_timeouts;
+    uint32_t recoveries;
+    uint32_t recovery_failures;
+} sx1262_diag_t;
 
 typedef enum {
     SX1262_EVT_NONE = 0,
@@ -45,6 +56,7 @@ typedef enum {
     SX1262_EVT_CAD_CLEAR,     /* CAD finished, channel free */
     SX1262_EVT_CAD_BUSY,      /* CAD finished, activity detected */
     SX1262_EVT_TIMEOUT,
+    SX1262_EVT_ERROR,
 } sx1262_event_t;
 
 /* Probes for the radio non-destructively (scratch register write/read).
@@ -71,6 +83,17 @@ esp_err_t sx1262_start_cad(void);
 
 /* Re-enters continuous RX (after TX_DONE or CAD). */
 esp_err_t sx1262_resume_rx(void);
+
+/* Resets, reconfigures, verifies critical registers, and re-enters RX.
+ * Recovery is bounded and leaves the driver not-ready if both attempts fail. */
+esp_err_t sx1262_recover(void);
+
+/* Independent software watchdog interval for a frame of this size. It is
+ * longer than the airtime-derived radio timeout and does not depend on IRQs. */
+uint32_t sx1262_tx_watchdog_ms(uint16_t len);
+
+/* Snapshot low-level command and recovery diagnostics. */
+void sx1262_get_diag(sx1262_diag_t *out);
 
 #ifdef __cplusplus
 }

@@ -12,9 +12,9 @@ A single node runs a genuinely simultaneous **dual-role BLE stack** on NimBLE. I
 
 - **Full BitChat handshake.** Implements the Noise XX pattern (`Noise_XX_25519_ChaChaPoly_SHA256`) via the bundled `noise_ref` (Noise-C) reference library, with Ed25519 identity binding like the mobile apps. Each node persists a Curve25519 static keypair and an Ed25519 signing keypair in NVS; its 8-byte peer ID is the first 8 bytes of SHA-256 over its Noise static public key.
 
-- **Signed identity announces.** Identity rides in a signed `ANNOUNCE` (type `0x01`) carrying TLVs for nickname, Noise static key, and Ed25519 signing key, plus two Bitle-private TLVs: firmware version (`0xB0`) and role/authority flags (`0xB1`). A legacy `0x13` identity-announce is still emitted best-effort for older clients. Inbound announces are hard-rejected unless the sender ID equals SHA-256(announced Noise key)[0:8].
+- **Signed identity announces with neighbor gossip.** Identity rides in a signed `ANNOUNCE` (type `0x01`) carrying TLVs for nickname, Noise static key, and Ed25519 signing key, the upstream `DIRECT_NEIGHBORS` gossip TLV (`0x04`, up to 10 verified direct peers, so phones can fold the node into their mesh graph and source-route through it), plus two Bitle-private TLVs: firmware version (`0xB0`) and role/authority flags (`0xB1`). A legacy `0x13` identity-announce is still emitted best-effort for older clients. Inbound announces are hard-rejected unless the sender ID equals SHA-256(announced Noise key)[0:8].
 
-- **Dual-role BLE mesh relay.** Packets are encoded/decoded with the BitChat binary format and relayed to every other subscribed link. Relay is TTL-based (packets with `ttl <= 1` are dropped, otherwise the TTL byte is decremented before rebroadcast) and de-duplicated with an FNV-1a fingerprint over the packet bytes (skipping the TTL byte) kept in a 64-entry ring. Own echoes, `REQUEST_SYNC`, packets addressed to this node, and undirected Noise handshakes are never relayed. Phone-fragmented packets are reassembled in a small bounded pool (2 slots, up to 4 parts × 501 bytes, 15 s timeout); anything larger is forwarded relay-only. Max handled BLE packet size is 520 bytes. A 30 s subscribe watchdog drops links that connect but never enable notifications, and a short deny/cool-down list prevents immediately re-dialing a just-dropped peer.
+- **Dual-role BLE mesh relay with source routing.** Packets are encoded/decoded with the BitChat binary format (v1 and v2) and forwarded like the upstream relay: TTL 0 stops forwarding, otherwise the TTL byte is decremented first. A v2 packet carrying a source route (flag `0x08`) is unicast toward the next hop when this node is listed in the route — peer IDs resolve to links through a direct-peer table — with duplicate-hop loop rejection, the signed route left byte-intact, and flood fallback when the next hop is not directly connected. Unrouted packets flood to every link except the ingress link and the original sender's own link. Flooding is de-duplicated with an FNV-1a fingerprint over the packet bytes (skipping the TTL byte) kept in a 64-entry ring. Own echoes, `REQUEST_SYNC`, packets addressed to this node, and undirected Noise handshakes are never relayed. A peer counts as **directly connected** exactly as upstream: a signature-verified announce from it arrived still at its origin TTL (7) on a live link. The node also learns the mesh graph from gossip TLVs and attaches source routes (version 2) to its own directed packets whose recipient is only reachable through the mesh, computed as the shortest path over mutually-confirmed edges. Phone-fragmented packets are reassembled in a small bounded pool (2 slots, up to 4 parts × 501 bytes, 15 s timeout); anything larger is forwarded relay-only. Max handled BLE packet size is 520 bytes (587 for routed v2). A 30 s subscribe watchdog drops links that connect but never enable notifications, and a short deny/cool-down list prevents immediately re-dialing a just-dropped peer.
 
 - **LoRa long-range trunk (ESP32-S3 nodes).** When an SX1262 is detected at boot, the node brings up a 915 MHz LoRa backbone between nodes — a second radio the phones never touch. The trunk registers as one more link in the transport-agnostic link registry, so the mesh relays BLE↔LoRa with no special cases: a message crosses the trunk and comes back down to BLE at the far end. See the [LoRa backhaul](#lora-backhaul) section for the details (framing, ARQ, spreading factor, range).
 
@@ -36,14 +36,14 @@ A single node runs a genuinely simultaneous **dual-role BLE stack** on NimBLE. I
 
 On ESP32-S3 nodes with a Wio-SX1262 module, Bitle runs a second radio: a 915 MHz LoRa **trunk** that carries traffic between nodes over kilometer-scale hops. BLE stays the access layer phones connect to; LoRa is backhaul only — phones have no LoRa radio and never see it. A message travels `phone → BLE → node → LoRa → node → BLE → phone`, like a cell tower's short access hop plus a long backhaul.
 
-- **One firmware, radio auto-detected.** `bitle_lora_init()` probes for the SX1262 at boot (scratch-register check). Found → the trunk comes up; absent (every C3, a bare S3) → the node runs BLE-only. Pin map and TCXO/RF-switch config match the Seeed Wio-SX1262 on the XIAO ESP32-S3.
+- **One firmware, radio auto-detected.** `bitle_lora_init()` probes for the SX1262 at boot (scratch-register check). Found → the trunk comes up; absent (every C3, a bare S3) → the node runs BLE-only. Board wiring (pin map, Vext power gate) is selected at build time via Kconfig: Seeed XIAO ESP32-S3 + Wio-SX1262 (default) and Heltec WiFi LoRa 32 V3 / Wireless Stick Lite V3 are supported — see [docs/LoRa-boards.md](docs/LoRa-boards.md).
 - **Trunk framing + reassembly.** Encoded BitChat packets are fragmented over ≤255-byte LoRa frames under a 16-byte trunk header (`0xB7 0x1E` magic, version, ftype, src/dst tag, seq, frag idx/total). Foreign LoRa traffic fails the magic check and is dropped. The receiver reassembles by `(src, seq)` and injects the packet into the same mesh core the BLE path uses.
 - **Per-frame ARQ.** Every non-announce frame is acknowledged and retransmitted up to three times; acks jump the queue and go out-of-band so a bidirectional exchange can't deadlock. Announces are ack-free periodic discovery beacons.
 - **Padding strip.** Phones pad handshakes/DMs to 256 bytes for BLE traffic-analysis resistance — pure airtime waste over the trunk. Because the BitChat packet is self-describing and padding trails the signature, the trunk trims to the true length before fragmenting (never touching signed/encrypted bytes). A 256-byte handshake message becomes one LoRa frame instead of three, which is what keeps a Noise first-contact handshake inside BitChat's timeout at high spreading factors.
 - **Admission + airtime governor.** The trunk carries relayed mesh traffic and the node's own discovery beacon; the node's own session-init and gossip `requestSync` are suppressed for broadcast links (a LoRa neighbor is a relay peer, not a chat/sync endpoint). Announces are throttled per origin (1 / 30 s) and pass a token-bucket airtime governor (default 25 % duty); message traffic is never throttled but still debits, so a busy DM session naturally quiets the beacons rather than the reverse. OTA image chunks stay off the trunk unless explicitly enabled (NVS `lora/ota_trunk`).
 - **Spreading factor and range.** Default **SF10 / BW125 / +22 dBm** — field-validated to complete an interactive DM (Noise handshake, auto-reply, receipts) through heavy non-line-of-sight (~700 ft / 30–40 walls). SF10 reaches ~2–3 km NLOS / ~8 km LOS; higher SF extends range at the cost of airtime (and handshake latency), lower SF is faster/shorter. Configurable via NVS `lora/sf`, `lora/freq`, `lora/duty_pct`, `lora/enabled`.
 
-Radio: **Semtech SX1262** (Seeed Wio-SX1262 + XIAO ESP32-S3), +22 dBm, 902–928 MHz, 125 kHz bandwidth, 2 dBi SMA antenna.
+Radio: **Semtech SX1262** (Seeed Wio-SX1262 + XIAO ESP32-S3, or Heltec V3 boards), +22 dBm, 902–928 MHz, 125 kHz bandwidth, 2 dBi SMA antenna.
 
 ## Boot sequence
 
@@ -70,6 +70,7 @@ Radio: **Semtech SX1262** (Seeed Wio-SX1262 + XIAO ESP32-S3), +22 dBm, 902–928
     ├── bitchat_ble.{c,h}       # dual-role BLE transport (peripheral + central)
     ├── bitle_link.{c,h}        # transport-agnostic link registry (BLE + LoRa)
     ├── bitle_mesh.{c,h}        # transport-agnostic dispatch, dedup, fragments, relay
+    ├── bitle_route.{c,h}       # direct-peer table, neighbor graph, source-route BFS
     ├── bitle_lora.{c,h}        # LoRa trunk: framing, ARQ, admission, padding strip
     ├── sx1262.{c,h}            # SX1262 LoRa radio driver (ESP-IDF native)
     ├── noise_handshake.{c,h}   # Noise XX, announce TLVs, message dispatch
@@ -104,6 +105,7 @@ Because OTA relies on this dual-slot layout, **nodes must be wire-flashed with t
 
 - **Bitle node (reference)** — Seeed Studio XIAO ESP32C3 with a 2.4 GHz antenna, solar charger, battery, and panel; the full parts list is at [bitle.org](https://bitle.org).
 - **Bitle-LR node (LoRa platform)** — the [Seeed Studio XIAO ESP32S3 & Wio-SX1262 kit](https://www.seeedstudio.com/Wio-SX1262-with-XIAO-ESP32S3-p-5982.html), also sold [with a 3D case, SMA antenna, and cable](https://www.seeedstudio.com/XIAO-ESP32S3-for-Meshtastic-LoRa-with-3D-Printed-Enclosure-p-6314.html). It ships pre-flashed with Meshtastic — run `idf.py erase-flash` before flashing Bitle. It runs the standard firmware as a full BLE relay node **and** brings up the SX1262 LoRa trunk between nodes (see [LoRa backhaul](#lora-backhaul)). Power parts (charger, battery, panel) are shared with the reference build.
+- **Bitle-LR node (Heltec V3)** — Heltec WiFi LoRa 32 V3 or Wireless Stick Lite V3 (ESP32-S3 + SX1262; both models share the same radio wiring). Select `CONFIG_BITLE_LORA_BOARD_HELTEC_V3=y` before building — the Vext peripheral rail is powered automatically; details in [docs/LoRa-boards.md](docs/LoRa-boards.md).
 
 ## Building & flashing
 
@@ -126,7 +128,7 @@ idf.py build
 idf.py -p /dev/cu.usbmodem101 flash monitor
 ```
 
-Adjust the serial port (`-p`) for your setup. `sdkconfig` is generated from `sdkconfig.defaults` on the first build.
+Adjust the serial port (`-p`) for your setup. `sdkconfig` is generated from `sdkconfig.defaults` on the first build; for `esp32s3`, `sdkconfig.defaults.esp32s3` layers on top (8 MB flash). On `esp32s3` the LoRa board wiring defaults to the Seeed XIAO + Wio-SX1262 — for Heltec V3 boards, select it via `idf.py menuconfig` → **Bitle hardware** → **SX1262 board wiring** before the first build (see [docs/LoRa-boards.md](docs/LoRa-boards.md)).
 
 ## Firmware updates & owner key
 

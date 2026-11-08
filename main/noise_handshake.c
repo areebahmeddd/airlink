@@ -18,6 +18,7 @@
 #include "bitchat_time.h"
 #include "bitle_courier.h"
 #include "bitle_ota.h"
+#include "bitle_route.h"
 #include "bitle_sync.h"
 #include "nickname_manager.h"
 #include "packet_codec.h"
@@ -48,6 +49,10 @@
 #define NOISE_PACKET_TTL          7
 #define NOISE_MAX_ENCRYPTED_PAYLOAD 320
 #define ANNOUNCE_INTERVAL_MS      (10 * 1000ULL)
+/* Upstream rejects announces more than 10 min off our clock; applied here
+ * only where staleness matters for security (the direct-peer mapping), so a
+ * node without a synced clock is never locked out of time recovery. */
+#define ANNOUNCE_SKEW_MS          (10 * 60 * 1000ULL)
 
 #define BITLE_AUTO_REPLY_TEXT \
     "This is an automated reply. Bitle is a relay node that extends the " \
@@ -161,6 +166,7 @@ static void process_courier_event(const noise_event_t *evt);
 static void process_sync_event(const noise_event_t *evt);
 static bool send_announce(noise_session_t *session);
 static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign);
+static esp_err_t encode_and_send_reserved(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign, bitle_link_reservation_t *reservation);
 static esp_err_t queue_event(const noise_event_t *evt, TickType_t wait_ticks);
 static bool enqueue_event(noise_evt_type_t type, uint16_t conn_handle, const uint8_t peer_id[8], bool initiator, const uint8_t *payload, uint16_t payload_len);
 static void handshake_task(void *arg);
@@ -611,7 +617,9 @@ static bool build_announce_payload(uint8_t *buffer, size_t buffer_len, size_t *o
         nickname_len = 255;
     }
 
-    size_t required = 2 + nickname_len + 2 + sizeof(s_static_public) + 2 + sizeof(s_ed25519_public);
+    /* Worst case adds a full DIRECT_NEIGHBORS TLV below. */
+    size_t required = 2 + nickname_len + 2 + sizeof(s_static_public) + 2 + sizeof(s_ed25519_public)
+                      + 2 + 4 + 2 + 1 + 2 + 8 * BITLE_ROUTE_MAX_NEIGHBORS;
     if (buffer_len < required) {
         ESP_LOGW(TAG, "ANNOUNCE payload buffer too small");
         return false;
@@ -652,6 +660,22 @@ static bool build_announce_payload(uint8_t *buffer, size_t buffer_len, size_t *o
     buffer[offset++] = 1;
     buffer[offset++] = 0x01 | (bitchat_time_is_authoritative() ? 0x02 : 0x00);
 
+    /* Upstream DIRECT_NEIGHBORS gossip TLV (0x04): our verified direct
+     * peers as N*8 peer-ID bytes, no count byte, capped at 10. Phones fold
+     * these into their mesh graph and can then source-route packets through
+     * us (docs/ANNOUNCEMENT_GOSSIP.md). Being inside the signed announce,
+     * the neighbor claim is authenticated like the keys above it. */
+    uint8_t peers[BITLE_ROUTE_MAX_NEIGHBORS][8];
+    int peer_count = bitle_route_direct_peers(peers, BITLE_ROUTE_MAX_NEIGHBORS);
+    if (peer_count > 0) {
+        buffer[offset++] = 0x04;
+        buffer[offset++] = (uint8_t)(peer_count * 8);
+        for (int i = 0; i < peer_count; ++i) {
+            memcpy(buffer + offset, peers[i], 8);
+            offset += 8;
+        }
+    }
+
     *out_len = offset;
     return true;
 }
@@ -662,10 +686,18 @@ static bool build_canonical_packet(const bitchat_packet_t *packet, uint8_t *out_
         return false;
     }
 
-    uint8_t header[BITCHAT_BLE_MAX_PACKET_SIZE];
+    /* Mirrors upstream BinaryProtocol.encodeForSigning: the full wire
+     * encoding minus the signature, with TTL forced to zero so relays may
+     * decrement it. The source route (v2, flag 0x08) is part of the signed
+     * bytes, so it must be reproduced here exactly; the signature, compress
+     * and Bitle-private RSR flags stay excluded as before. */
+    bool routed = packet->has_route && packet->route_count > 0;
+    bool v2 = packet->version >= 2 || routed;
+
+    uint8_t header[BITLE_PACKET_MAX_ROUTED];
     size_t header_len = 0;
 
-    header[header_len++] = packet->version;
+    header[header_len++] = v2 ? 2 : 1;
     header[header_len++] = packet->type;
     header[header_len++] = 0; // TTL forced to zero
 
@@ -677,8 +709,15 @@ static bool build_canonical_packet(const bitchat_packet_t *packet, uint8_t *out_
     if (packet->has_recipient) {
         flags |= 0x01;
     }
+    if (routed) {
+        flags |= 0x08;
+    }
     header[header_len++] = flags;
 
+    if (v2) {
+        header[header_len++] = (packet->payload_len >> 24) & 0xFF;
+        header[header_len++] = (packet->payload_len >> 16) & 0xFF;
+    }
     header[header_len++] = (packet->payload_len >> 8) & 0xFF;
     header[header_len++] = packet->payload_len & 0xFF;
 
@@ -688,6 +727,14 @@ static bool build_canonical_packet(const bitchat_packet_t *packet, uint8_t *out_
     if (packet->has_recipient) {
         memcpy(header + header_len, packet->recipient_id, sizeof(packet->recipient_id));
         header_len += sizeof(packet->recipient_id);
+    }
+
+    if (routed) {
+        header[header_len++] = packet->route_count;
+        for (uint8_t i = 0; i < packet->route_count; ++i) {
+            memcpy(header + header_len, packet->route[i], sizeof(packet->route[i]));
+            header_len += sizeof(packet->route[i]);
+        }
     }
 
     if (header_len + packet->payload_len > max_len) {
@@ -707,7 +754,7 @@ static bool build_canonical_packet(const bitchat_packet_t *packet, uint8_t *out_
 
 static bool sign_packet(bitchat_packet_t *packet)
 {
-    uint8_t buffer[BITCHAT_BLE_MAX_PACKET_SIZE];
+    uint8_t buffer[BITLE_PACKET_MAX_ROUTED];
     size_t canonical_len = 0;
     if (!build_canonical_packet(packet, buffer, &canonical_len, sizeof(buffer))) {
         ESP_LOGW(TAG, "Canonical encode failed for type=0x%02X", packet->type);
@@ -789,7 +836,7 @@ bool noise_announce_link(uint16_t link_handle)
     if (!bitchat_time_is_valid()) {
         return false;
     }
-    uint8_t announce_payload[128];
+    uint8_t announce_payload[NOISE_MESSAGE_MAX];
     size_t announce_len = 0;
     if (!build_announce_payload(announce_payload, sizeof(announce_payload), &announce_len)) {
         return false;
@@ -824,7 +871,7 @@ static bool send_announce(noise_session_t *session)
         return false;
     }
 
-    uint8_t announce_payload[128];
+    uint8_t announce_payload[NOISE_MESSAGE_MAX];
     size_t announce_len = 0;
     if (!build_announce_payload(announce_payload, sizeof(announce_payload), &announce_len)) {
         ESP_LOGW(TAG, "Failed to build ANNOUNCE payload");
@@ -1003,6 +1050,36 @@ static bool parse_announce_tlv(const uint8_t *payload, size_t len, noise_identit
     return have_nick && have_noise && have_sign;
 }
 
+/* Extracts the upstream DIRECT_NEIGHBORS gossip TLV (0x04): N*8 peer-ID
+ * bytes, no count byte — N = len/8, trailing partial bytes ignored. Returns
+ * the entry count (0 when the TLV is absent, which upstream treats as an
+ * explicit "I have no direct neighbors"). Callers run this only after the
+ * payload passed parse_announce_tlv, so TLV framing is already known good. */
+static int parse_announce_neighbors(const uint8_t *payload, size_t len,
+                                    uint8_t out[][8], int max)
+{
+    size_t offset = 0;
+    while (offset + 2 <= len) {
+        uint8_t tlv_type = payload[offset++];
+        uint8_t tlv_len = payload[offset++];
+        if (offset + tlv_len > len) {
+            return 0;
+        }
+        if (tlv_type == 0x04) {
+            int n = tlv_len / 8;
+            if (n > max) {
+                n = max;
+            }
+            for (int i = 0; i < n; ++i) {
+                memcpy(out[i], payload + offset + (size_t)i * 8, 8);
+            }
+            return n;
+        }
+        offset += tlv_len;
+    }
+    return 0;
+}
+
 /* Returns false when the sender ID is not derived from the announced Noise
  * key (spoofed announce, hard reject). Sets *out_sig_ok when the packet
  * signature verifies against the announced signing key. */
@@ -1025,7 +1102,7 @@ static bool verify_announce_event(const noise_event_t *evt, const noise_identity
     packet.payload = (uint8_t *)evt->payload;
     packet.payload_len = evt->payload_len;
 
-    uint8_t canonical[BITCHAT_BLE_MAX_PACKET_SIZE];
+    uint8_t canonical[BITLE_PACKET_MAX_ROUTED];
     size_t canonical_len = 0;
     if (build_canonical_packet(&packet, canonical, &canonical_len, sizeof(canonical))) {
         *out_sig_ok = ed25519_sign_open(canonical, canonical_len,
@@ -1195,7 +1272,25 @@ static void format_hex(const uint8_t *data, size_t len, char *out, size_t out_le
     out[len * 2] = '\0';
 }
 
-static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign)
+static esp_err_t send_result_to_error(bitle_link_send_result_t result)
+{
+    switch (result) {
+    case BITLE_LINK_SEND_ACCEPTED:
+        return ESP_OK;
+    case BITLE_LINK_SEND_DEFERRED:
+        return ESP_ERR_TIMEOUT;
+    case BITLE_LINK_SEND_POLICY_DROPPED:
+        return ESP_ERR_NOT_SUPPORTED;
+    case BITLE_LINK_SEND_FAILED:
+    default:
+        return ESP_FAIL;
+    }
+}
+
+static esp_err_t encode_and_send_reserved(
+    uint16_t conn_handle, bitchat_message_type_t type,
+    const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len,
+    bool sign, bitle_link_reservation_t *reservation)
 {
     bitchat_packet_t packet;
     memset(&packet, 0, sizeof(packet));
@@ -1207,6 +1302,7 @@ static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t ty
     packet.timestamp_ms = bitchat_time_now_ms();
     if (!packet.timestamp_ms) {
         ESP_LOGW(TAG, "Skipping send; timestamp invalid for type=0x%02X", type);
+        bitle_link_cancel_send(reservation);
         return ESP_ERR_INVALID_STATE;
     }
     memcpy(packet.sender_id, s_peer_id, sizeof(packet.sender_id));
@@ -1226,10 +1322,24 @@ static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t ty
     size_t encoded_len = sizeof(buffer);
     if (!bitchat_packet_encode(&packet, buffer, &encoded_len, sizeof(buffer))) {
         ESP_LOGE(TAG, "Failed to encode packet type=0x%02X", type);
+        bitle_link_cancel_send(reservation);
         return ESP_FAIL;
     }
 
+    if (reservation) {
+        return send_result_to_error(bitle_link_commit_send(
+            reservation, buffer, (uint16_t)encoded_len));
+    }
     return bitle_link_send(conn_handle, buffer, (uint16_t)encoded_len);
+}
+
+static esp_err_t encode_and_send(
+    uint16_t conn_handle, bitchat_message_type_t type,
+    const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len,
+    bool sign)
+{
+    return encode_and_send_reserved(
+        conn_handle, type, recipient_id, payload, payload_len, sign, NULL);
 }
 
 static esp_err_t queue_event(const noise_event_t *evt, TickType_t wait_ticks)
@@ -1463,6 +1573,29 @@ static void process_announce_event(const noise_event_t *evt)
              * (direct), flood one copy (relayed owner), or spray carriers. */
             bitle_courier_peer_announced(conn_handle, evt->peer_id, ident.noise_key,
                                          true, is_direct, bitchat_time_now_ms());
+            /* Mesh graph: every verified announce refreshes the sender's
+             * neighborhood (relayed ones too — that is how topology past our
+             * direct peers is learned). A direct one additionally pins the
+             * peer to this link, which is what makes it a usable next hop
+             * for source-routed forwarding. Mirrors upstream: direct iff the
+             * announce is verified AND still at its origin TTL. */
+            uint8_t neighbors[BITLE_ROUTE_MAX_NEIGHBORS][8];
+            int neighbor_count = parse_announce_neighbors(evt->payload, evt->payload_len,
+                                                          neighbors, BITLE_ROUTE_MAX_NEIGHBORS);
+            bitle_route_note_neighbors(evt->peer_id, neighbors, neighbor_count,
+                                       evt->timestamp_ms);
+            if (is_direct) {
+                /* A non-decremented re-broadcast of an old announce (the
+                 * dedup re-admit path makes such copies visible) must not
+                 * pin this peer ID to the attacker's link. */
+                uint64_t now_ms = bitchat_time_now_ms();
+                bool fresh = !bitchat_time_is_valid() ||
+                             (evt->timestamp_ms + ANNOUNCE_SKEW_MS > now_ms &&
+                              evt->timestamp_ms < now_ms + ANNOUNCE_SKEW_MS);
+                if (fresh) {
+                    bitle_route_note_direct(evt->peer_id, conn_handle);
+                }
+            }
             /* Authoritative clock source: a phone (no 0xB1) is the time
              * authority and may correct even a wrong synced clock; an
              * authoritative Bitle propagates real time hop-by-hop. Only
@@ -1711,20 +1844,70 @@ bool noise_send_encrypted(uint16_t conn_handle, bitchat_noise_payload_type_t pay
         ESP_LOGW(TAG, "Payload too large for encryption");
         return false;
     }
+    bitle_link_reservation_t reservation = {0};
+    /* Reserve the LoRa pool slot or BLE mbuf before the cipher state consumes
+     * this explicit Noise nonce. A backpressured transport therefore leaves
+     * both the application nonce and NoiseCipherState unchanged. */
+    bitle_link_send_result_t reserve_result = bitle_link_reserve_send(
+        conn_handle, BITCHAT_MSG_NOISE_ENCRYPTED, &reservation);
+    if (reserve_result != BITLE_LINK_SEND_ACCEPTED) {
+        return false;
+    }
+    bitle_link_reservation_t *reserved_send = &reservation;
     framed[0] = (uint8_t)payload_type;
     memcpy(framed + 1, payload, payload_len);
     uint8_t ciphertext[NOISE_MAX_ENCRYPTED_PAYLOAD];
     size_t ciphertext_len = sizeof(ciphertext);
     if (!encrypt_payload(session, framed, payload_len + 1, ciphertext, &ciphertext_len)) {
+        bitle_link_cancel_send(reserved_send);
         ESP_LOGW(TAG, "Encryption failed for conn=%u", conn_handle);
         return false;
     }
-    return encode_and_send(conn_handle, BITCHAT_MSG_NOISE_ENCRYPTED, session->peer_id, ciphertext, ciphertext_len, true) == ESP_OK;
+    return encode_and_send_reserved(
+               conn_handle, BITCHAT_MSG_NOISE_ENCRYPTED, session->peer_id,
+               ciphertext, ciphertext_len, true, reserved_send) == ESP_OK;
 }
 
 esp_err_t noise_send_raw(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t recipient[8], const uint8_t *payload, size_t payload_len)
 {
     return encode_and_send(conn_handle, type, recipient, payload, payload_len, false);
+}
+
+/* Attaches a source route to a directed packet whose recipient is only
+ * reachable through the mesh, mirroring upstream applyRouteIfAvailable:
+ * confirmed-edge shortest path, intermediates only, version bumped to 2 (the
+ * route is then covered by the packet signature). Direct recipients,
+ * broadcast, link-local (ttl 0) traffic and the Bitle-private OTA types are
+ * left alone. */
+static void maybe_attach_route(bitchat_packet_t *packet)
+{
+    if (!packet->has_recipient || packet->ttl == 0) {
+        return;
+    }
+    if (packet->type >= BITLE_MSG_OTA_MANIFEST) {
+        return; /* 0xA0..0xA3: node-to-node on direct links by design */
+    }
+    bool broadcast = true;
+    for (size_t i = 0; i < sizeof(packet->recipient_id); ++i) {
+        if (packet->recipient_id[i] != 0xFF) {
+            broadcast = false;
+            break;
+        }
+    }
+    if (broadcast) {
+        return;
+    }
+    if (bitle_route_is_direct(packet->recipient_id)) {
+        return; /* direct neighbors get no route, like upstream */
+    }
+    uint8_t hops[BITLE_ROUTE_MAX_HOPS][8];
+    int hop_count = bitle_route_compute(s_peer_id, packet->recipient_id, hops, BITLE_ROUTE_MAX_HOPS);
+    if (hop_count >= 1) {
+        memcpy(packet->route, hops, (size_t)hop_count * 8);
+        packet->route_count = (uint8_t)hop_count;
+        packet->has_route = true;
+        packet->version = 2;
+    }
 }
 
 esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t recipient[8], const uint8_t *payload, size_t payload_len, uint8_t ttl, bool sign)
@@ -1745,20 +1928,45 @@ esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, c
     }
     packet.payload = (uint8_t *)payload;
     packet.payload_len = payload_len;
+    maybe_attach_route(&packet);
     if (sign && !sign_packet(&packet)) {
         return ESP_FAIL;
     }
-    uint8_t buffer[BITCHAT_BLE_MAX_PACKET_SIZE];
+    uint8_t buffer[BITLE_PACKET_MAX_ROUTED];
     size_t encoded_len = sizeof(buffer);
     if (!bitchat_packet_encode(&packet, buffer, &encoded_len, sizeof(buffer))) {
         return ESP_FAIL;
     }
-    return bitle_link_send(conn_handle, buffer, (uint16_t)encoded_len);
+    /* With a route, transmit only toward the first hop (upstream broadcaster
+     * stage A); the caller's link is the fallback when it vanished. */
+    uint16_t out_link = conn_handle;
+    if (packet.has_route && packet.route_count > 0) {
+        uint16_t first = bitle_route_link_for(packet.route[0]);
+        if (first != BITLE_LINK_NONE) {
+            out_link = first;
+        }
+    }
+    return bitle_link_send(out_link, buffer, (uint16_t)encoded_len);
+}
+
+const char *noise_get_nickname(void)
+{
+    return s_nickname;
+}
+
+int noise_verified_peer_count(void)
+{
+    int count = 0;
+    for (size_t i = 0; i < NOISE_MAX_SESSIONS; ++i) {
+        if (s_identities[i].valid && s_identities[i].verified) {
+            count++;
+        }
+    }
+    return count;
 }
 
 bool noise_get_peer_identity(uint16_t conn_handle, uint8_t noise_key[32], uint8_t sign_key[32], bool *verified)
-{
-    noise_session_t *session = find_session(conn_handle);
+{    noise_session_t *session = find_session(conn_handle);
     if (!session) {
         return false;
     }
@@ -1783,7 +1991,7 @@ bool noise_verify_packet_signature(const bitchat_packet_t *packet, const uint8_t
     if (!packet || !packet->has_signature) {
         return false;
     }
-    uint8_t canonical[BITCHAT_BLE_MAX_PACKET_SIZE];
+    uint8_t canonical[BITLE_PACKET_MAX_ROUTED];
     size_t canonical_len = 0;
     if (!build_canonical_packet(packet, canonical, &canonical_len, sizeof(canonical))) {
         return false;
@@ -1791,6 +1999,27 @@ bool noise_verify_packet_signature(const bitchat_packet_t *packet, const uint8_t
     return ed25519_sign_open(canonical, canonical_len,
                              (unsigned char *)sign_key,
                              (unsigned char *)packet->signature) == 0;
+}
+
+bool noise_verify_announce_identity(
+    const bitchat_packet_t *packet, uint8_t out_sign_key[32])
+{
+    if (!packet || !out_sign_key || packet->type != BITCHAT_MSG_ANNOUNCE ||
+        !packet->has_signature) {
+        return false;
+    }
+    noise_identity_t identity = {0};
+    if (!parse_announce_tlv(packet->payload, packet->payload_len, &identity)) {
+        return false;
+    }
+    uint8_t hash[32];
+    bitle_sha256(identity.noise_key, sizeof(identity.noise_key), hash);
+    if (memcmp(hash, packet->sender_id, sizeof(packet->sender_id)) != 0 ||
+        !noise_verify_packet_signature(packet, identity.sign_key)) {
+        return false;
+    }
+    memcpy(out_sign_key, identity.sign_key, sizeof(identity.sign_key));
+    return true;
 }
 
 void noise_poll(void)
@@ -1868,4 +2097,3 @@ static void poll_session_maintenance(void)
         }
     }
 }
-

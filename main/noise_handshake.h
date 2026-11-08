@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bitchat_ble.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -49,6 +51,17 @@ typedef enum {
     BITCHAT_NOISE_PAYLOAD_VERIFY_RESPONSE = 0x11,
 } bitchat_noise_payload_type_t;
 
+/* Upstream source routing (docs/SOURCE_ROUTING.md): a v2 packet may carry a
+ * route — an ordered list of intermediate 8-byte peer IDs, sender and final
+ * recipient excluded. Relays listed in it forward to the next hop; everyone
+ * else floods. Longer routes decode as truncated and are flooded, never
+ * dropped. */
+#define BITLE_ROUTE_MAX_HOPS 8
+
+/* Largest packet this node originates: the v1 BLE budget plus the v2
+ * length-field growth and a full-size source route. */
+#define BITLE_PACKET_MAX_ROUTED (BITCHAT_BLE_MAX_PACKET_SIZE + 2 + 1 + 8 * BITLE_ROUTE_MAX_HOPS)
+
 typedef struct {
     uint8_t version;
     uint8_t type;
@@ -59,6 +72,10 @@ typedef struct {
     bool has_recipient;
     bool is_compressed;
     bool is_rsr;               /* flag 0x10: solicited sync response replay */
+    bool has_route;            /* v2 flag 0x08: source route present */
+    bool route_truncated;      /* wire route longer than BITLE_ROUTE_MAX_HOPS */
+    uint8_t route_count;       /* valid entries in route */
+    uint8_t route[BITLE_ROUTE_MAX_HOPS][8];
     uint8_t *payload;
     uint16_t payload_len;
     uint8_t signature[64];
@@ -101,6 +118,12 @@ esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, c
  * (used by the LoRa trunk for neighbor beacons). */
 bool noise_announce_link(uint16_t link_handle);
 
+/* Local node's nickname (e.g. "Bitle-9550"), for the status display. */
+const char *noise_get_nickname(void);
+
+/* Direct peers with a verified announced identity. */
+int noise_verified_peer_count(void);
+
 /* Identity of the direct peer on a connection, learned from its announce.
  * Returns false until a direct announce has been parsed. *verified reflects
  * whether the announce's Ed25519 packet signature checked out. */
@@ -109,6 +132,12 @@ bool noise_get_peer_identity(uint16_t conn_handle, uint8_t noise_key[32], uint8_
 /* Verifies an inbound packet's Ed25519 signature against a signing key
  * (rebuilds the padded canonical bytes exactly as the phones do). */
 bool noise_verify_packet_signature(const bitchat_packet_t *packet, const uint8_t sign_key[32]);
+
+/* Strictly verifies a current ANNOUNCE for LoRa neighbor learning: the sender
+ * must derive from the announced Noise key and its Ed25519 packet signature
+ * must verify. Copies the authenticated signing key on success. */
+bool noise_verify_announce_identity(
+    const bitchat_packet_t *packet, uint8_t out_sign_key[32]);
 void noise_poll(void);
 esp_err_t bitchat_noise_init(void);
 
