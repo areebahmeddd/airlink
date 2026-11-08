@@ -1,0 +1,17 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "N", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests and the vector generator's self-checks are made of asserts.
+"test/device/**" = ["S101"]
+"tools/vectors/**" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["test/device"]
+markers = [
+    "lora: needs two LoRa boards on the same region",
+]

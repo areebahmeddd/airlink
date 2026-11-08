@@ -1,0 +1,20 @@
+# Style is astyle's, so readability checks are left out, and so are checks
+# that only restate a deliberate pattern, such as tables laid over one aligned
+# arena (casting-through-void), int8_t read as a number, not a character
+# (signed-char-misuse and its CERT alias str34-c), and constant sizes such as
+# 4u * 1024u (implicit-widening), which cannot overflow.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-casting-through-void,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-signed-char-misuse,
+  -cert-err33-c,
+  -cert-str34-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+WarningsAsErrors: "*"
+HeaderFilterRegex: "components/.*/include/.*"
